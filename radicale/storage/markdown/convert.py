@@ -49,7 +49,7 @@ _HANDLED_ICAL_PROPS = {
     "uid", "summary", "dtstart", "dtend", "duration",
     "location", "description", "status", "categories",
     "rrule", "exdate", "rdate", "transp", "url", "geo",
-    "priority", "sequence", "dtstamp",
+    "priority", "sequence", "dtstamp", "created", "last-modified",
     # Structural / always-present
     "prodid", "version", "calscale", "method",
 }
@@ -274,6 +274,23 @@ def md_to_vcalendar(fm: Dict[str, Any], body: str = "") -> vobject.base.Componen
     if "description" not in fm and body:
         vevent.add("description").value = body
 
+    # Timestamp properties — set explicitly for ETag stability
+    from vobject.icalendar import utc as vobj_utc
+    _TS_FIELDS = {
+        "dtstamp": "DTSTAMP",
+        "created": "CREATED",
+        "last_modified": "LAST-MODIFIED",
+    }
+    for fm_key, ical_name in _TS_FIELDS.items():
+        ts_val = fm.get(fm_key)
+        if ts_val:
+            try:
+                dt = datetime.datetime.strptime(str(ts_val), "%Y%m%dT%H%M%SZ")
+                dt = dt.replace(tzinfo=vobj_utc)
+                vevent.add(ical_name).value = dt
+            except (ValueError, AttributeError):
+                pass
+
     # ical_extra: inject preserved iCalendar properties
     ical_extra = fm.get("ical_extra", {})
     if isinstance(ical_extra, dict):
@@ -385,6 +402,16 @@ def vcalendar_to_md(cal: vobject.base.Component) -> Tuple[Dict[str, Any], str]:
 
     if tz_name:
         fm["timezone"] = tz_name
+
+    # Preserve timestamp properties for ETag stability
+    for ts_prop in ("dtstamp", "created", "last_modified"):
+        attr = ts_prop.replace("_", "-")
+        if attr in vevent.contents:
+            val = vevent.contents[attr][0].value
+            if isinstance(val, datetime.datetime):
+                fm[ts_prop] = val.strftime("%Y%m%dT%H%M%SZ")
+            elif isinstance(val, str):
+                fm[ts_prop] = val
 
     # Simple properties
     for ical_prop, fm_key in _ICAL_TO_FM.items():
