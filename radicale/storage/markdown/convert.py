@@ -472,10 +472,12 @@ def vcalendar_to_md(cal: vobject.base.Component,
             continue
         if prop_name.lower() in {k.lower() for k in _FM_TO_ICAL.values()}:
             continue
+        # Skip sub-components (e.g. VALARM) — handled separately below
+        if prop_list and hasattr(prop_list[0], 'components'):
+            continue
         values = []
         for prop in prop_list:
             try:
-                # Store just the value, not the full serialized line
                 val = prop.value
                 if isinstance(val, datetime.datetime):
                     values.append(val.strftime("%Y%m%dT%H%M%SZ"))
@@ -483,8 +485,12 @@ def vcalendar_to_md(cal: vobject.base.Component,
                     values.append(val.strftime("%Y%m%d"))
                 else:
                     values.append(str(val))
-            except Exception:
-                values.append(str(prop.value))
+            except (AttributeError, Exception):
+                # Fallback: serialize the raw line
+                try:
+                    values.append(prop.serialize().strip())
+                except Exception:
+                    pass
         if len(values) == 1:
             ical_extra[prop_name.upper()] = values[0]
         else:
