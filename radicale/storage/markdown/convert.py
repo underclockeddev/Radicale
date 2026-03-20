@@ -155,6 +155,202 @@ def _parse_time(value: str) -> datetime.time:
     raise ValueError("Cannot parse time: %r" % value)
 
 
+# ── Reminder helpers ───────────────────────────────────────────────────────
+
+# Maps human-readable units to ISO 8601 duration components
+_DURATION_UNITS = [
+    ("w", "W", 7 * 24 * 3600),
+    ("d", "D", 24 * 3600),
+    ("h", "H", 3600),
+    ("m", "M", 60),
+]
+
+
+def _parse_trigger_duration(trigger_str: str) -> Optional[datetime.timedelta]:
+    """Parse an iCal TRIGGER duration like '-P1D', '-PT15M', 'PT1H'."""
+    s = trigger_str.strip()
+    negative = s.startswith("-")
+    s = s.lstrip("+-")
+    if not s.startswith("P"):
+        return None
+    s = s[1:]  # strip P
+
+    weeks = days = hours = minutes = seconds = 0
+    # Date part (before T)
+    time_part = ""
+    if "T" in s:
+        date_part, time_part = s.split("T", 1)
+    else:
+        date_part = s
+
+    for val, unit in re.findall(r"(\d+)([WDHMS])", date_part):
+        n = int(val)
+        if unit == "W":
+            weeks = n
+        elif unit == "D":
+            days = n
+
+    for val, unit in re.findall(r"(\d+)([HMS])", time_part):
+        n = int(val)
+        if unit == "H":
+            hours = n
+        elif unit == "M":
+            minutes = n
+        elif unit == "S":
+            seconds = n
+
+    td = datetime.timedelta(weeks=weeks, days=days, hours=hours,
+                            minutes=minutes, seconds=seconds)
+    return -td if negative else td
+
+
+def _timedelta_to_human(td: datetime.timedelta, related: str) -> str:
+    """Convert a timedelta + RELATED param to human-readable reminder string.
+
+    related is 'START' or 'END'.
+    """
+    total = int(abs(td.total_seconds()))
+    before = td.total_seconds() <= 0
+    anchor = related.lower()  # "start" or "end"
+
+    if total == 0:
+        return "at %s" % anchor
+
+    parts = []
+    weeks = total // (7 * 24 * 3600)
+    remainder = total % (7 * 24 * 3600)
+    days = remainder // (24 * 3600)
+    remainder %= 24 * 3600
+    hours = remainder // 3600
+    remainder %= 3600
+    minutes = remainder // 60
+
+    if weeks:
+        parts.append("%dw" % weeks)
+    if days:
+        parts.append("%dd" % days)
+    if hours:
+        parts.append("%dh" % hours)
+    if minutes:
+        parts.append("%dm" % minutes)
+
+    if not parts:
+        parts.append("0m")
+
+    time_str = " ".join(parts)
+    direction = "before" if before else "after"
+    return "%s %s %s" % (time_str, direction, anchor)
+
+
+def _human_to_valarm(reminder: str) -> Optional[vobject.base.Component]:
+    """Parse a human-readable reminder string into a VALARM component.
+
+    Formats: '15m before start', '1d before end', '1w 2d after start',
+             'at start', 'at end'
+    """
+    s = reminder.strip().lower()
+
+    # "at start" / "at end"
+    m = re.match(r"at\s+(start|end)$", s)
+    if m:
+        related = m.group(1).upper()
+        trigger = "PT0S"
+        return _build_valarm(trigger, related)
+
+    # "Xd Yh before/after start/end"
+    m = re.match(
+        r"([\d\s]*\d\s*[wdhm](?:\s+\d+\s*[wdhm])*)\s+(before|after)\s+(start|end)$",
+        s)
+    if not m:
+        return None
+
+    time_str = m.group(1)
+    direction = m.group(2)
+    anchor = m.group(3).upper()
+
+    weeks = days = hours = minutes = 0
+    for val, unit in re.findall(r"(\d+)\s*([wdhm])", time_str):
+        n = int(val)
+        if unit == "w":
+            weeks = n
+        elif unit == "d":
+            days = n
+        elif unit == "h":
+            hours = n
+        elif unit == "m":
+            minutes = n
+
+    # Build ISO 8601 duration
+    date_parts = ""
+    if weeks:
+        date_parts += "%dW" % weeks
+    if days:
+        date_parts += "%dD" % days
+    time_parts = ""
+    if hours:
+        time_parts += "%dH" % hours
+    if minutes:
+        time_parts += "%dM" % minutes
+
+    if time_parts:
+        duration = "P%sT%s" % (date_parts, time_parts)
+    elif date_parts:
+        duration = "P%s" % date_parts
+    else:
+        duration = "PT0S"
+
+    sign = "-" if direction == "before" else ""
+    trigger = sign + duration
+
+    return _build_valarm(trigger, anchor)
+
+
+def _build_valarm(trigger: str, related: str) -> vobject.base.Component:
+    """Build a VALARM vobject component."""
+    lines = ["BEGIN:VALARM", "ACTION:DISPLAY",
+             "DESCRIPTION:Reminder"]
+    if related == "END":
+        lines.append("TRIGGER;RELATED=END:%s" % trigger)
+    else:
+        lines.append("TRIGGER:%s" % trigger)
+    lines.append("END:VALARM")
+    alarm_text = "\r\n".join(lines)
+    wrapper = ("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n"
+               + alarm_text + "\r\nEND:VEVENT\r\nEND:VCALENDAR")
+    parsed = vobject.readOne(wrapper)
+    for child in parsed.vevent.components():
+        if child.name == "VALARM":
+            return child
+    raise ValueError("Failed to parse VALARM")
+
+
+def _valarm_to_human(alarm: vobject.base.Component) -> Optional[str]:
+    """Convert a VALARM component to a human-readable reminder string."""
+    if not hasattr(alarm, "trigger"):
+        return None
+    trigger = alarm.trigger
+    trigger_val = trigger.value
+    # trigger_val can be a timedelta or a datetime
+    if isinstance(trigger_val, datetime.timedelta):
+        td = trigger_val
+    elif isinstance(trigger_val, datetime.datetime):
+        # Absolute trigger — can't represent as relative
+        return None
+    else:
+        # Try parsing as string
+        td = _parse_trigger_duration(str(trigger_val))
+        if td is None:
+            return None
+
+    # Check RELATED param (default is START)
+    params = getattr(trigger, "params", {})
+    related_list = params.get("RELATED", ["START"])
+    related = related_list[0] if isinstance(related_list, list) else str(related_list)
+    related = related.upper() if related else "START"
+
+    return _timedelta_to_human(td, related)
+
+
 def md_to_vcalendar(fm: Dict[str, Any], body: str = "") -> vobject.base.Component:
     """Convert frontmatter + body into a VCALENDAR vobject component."""
     cal = vobject.iCalendar()
@@ -290,6 +486,19 @@ def md_to_vcalendar(fm: Dict[str, Any], body: str = "") -> vobject.base.Componen
                 dt = dt.replace(tzinfo=vobj_utc)
                 vevent.add(ical_name).value = dt
             except (ValueError, AttributeError):
+                pass
+
+    # Reminders → VALARM sub-components
+    reminders = fm.get("reminders")
+    if reminders:
+        if isinstance(reminders, str):
+            reminders = [r.strip() for r in reminders.split(",")]
+        for reminder in reminders:
+            try:
+                alarm = _human_to_valarm(str(reminder))
+                if alarm:
+                    vevent.add(alarm)
+            except Exception:
                 pass
 
     # ical_extra: inject preserved iCalendar properties
@@ -496,16 +705,24 @@ def vcalendar_to_md(cal: vobject.base.Component,
         else:
             ical_extra[prop_name.upper()] = values
 
-    # Collect VALARM sub-components
-    alarms = []
+    # Collect VALARM sub-components as human-readable reminders
+    reminders = []
+    raw_alarms = []
     for child in vevent.components():
         if child.name == "VALARM":
-            try:
-                alarms.append(child.serialize().strip())
-            except Exception:
-                pass
-    if alarms:
-        ical_extra["VALARM"] = alarms if len(alarms) > 1 else alarms[0]
+            human = _valarm_to_human(child)
+            if human:
+                reminders.append(human)
+            else:
+                # Can't parse — preserve raw for lossless round-trip
+                try:
+                    raw_alarms.append(child.serialize().strip())
+                except Exception:
+                    pass
+    if reminders:
+        fm["reminders"] = reminders
+    if raw_alarms:
+        ical_extra["VALARM"] = raw_alarms if len(raw_alarms) > 1 else raw_alarms[0]
 
     if ical_extra:
         fm["ical_extra"] = ical_extra

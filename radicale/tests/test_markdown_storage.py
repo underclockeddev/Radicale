@@ -253,6 +253,113 @@ class TestFullConversionRoundTrip:
         assert "Bring your laptops" in body_rt
 
 
+class TestReminders:
+    """Tests for human-readable reminder ↔ VALARM conversion."""
+
+    def test_valarm_to_reminder_before_start(self):
+        """TRIGGER:-P1D → '1d before start'"""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rem1\r\n"
+            "SUMMARY:Test\r\nDTSTART:20260320T100000\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-P1D\r\n"
+            "DESCRIPTION:Reminder\r\nEND:VALARM\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, _ = vcalendar_to_md(cal)
+        assert "reminders" in fm
+        assert "1d before start" in fm["reminders"]
+
+    def test_valarm_to_reminder_minutes(self):
+        """TRIGGER:-PT15M → '15m before start'"""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rem2\r\n"
+            "SUMMARY:Test\r\nDTSTART:20260320T100000\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\n"
+            "DESCRIPTION:Reminder\r\nEND:VALARM\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, _ = vcalendar_to_md(cal)
+        assert "15m before start" in fm["reminders"]
+
+    def test_valarm_to_reminder_after_end(self):
+        """TRIGGER;RELATED=END:PT1H → '1h after end'"""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rem3\r\n"
+            "SUMMARY:Test\r\nDTSTART:20260320T100000\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\n"
+            "TRIGGER;RELATED=END:PT1H\r\n"
+            "DESCRIPTION:Reminder\r\nEND:VALARM\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, _ = vcalendar_to_md(cal)
+        assert "1h after end" in fm["reminders"]
+
+    def test_valarm_to_reminder_week(self):
+        """TRIGGER:-P7D → '1w before start'"""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rem4\r\n"
+            "SUMMARY:Test\r\nDTSTART:20260320T100000\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-P7D\r\n"
+            "DESCRIPTION:Reminder\r\nEND:VALARM\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, _ = vcalendar_to_md(cal)
+        assert "1w before start" in fm["reminders"]
+
+    def test_multiple_reminders(self):
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rem5\r\n"
+            "SUMMARY:Test\r\nDTSTART:20260320T100000\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-P1D\r\n"
+            "DESCRIPTION:R\r\nEND:VALARM\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\n"
+            "DESCRIPTION:R\r\nEND:VALARM\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, _ = vcalendar_to_md(cal)
+        assert len(fm["reminders"]) == 2
+        assert "1d before start" in fm["reminders"]
+        assert "15m before start" in fm["reminders"]
+
+    def test_no_valarm_no_reminders(self):
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rem6\r\n"
+            "SUMMARY:Test\r\nDTSTART:20260320T100000\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, _ = vcalendar_to_md(cal)
+        assert "reminders" not in fm
+
+    def test_reminder_to_valarm_roundtrip(self):
+        """Human-readable reminders survive MD → iCal → MD."""
+        fm_orig = {
+            "uid": "rt-rem1",
+            "title": "Birthday",
+            "start": "2026-06-15",
+            "all_day": True,
+            "reminders": ["1d before start", "1w before start",
+                          "15m before start", "1h after end"],
+        }
+        cal = md_to_vcalendar(fm_orig)
+        fm_rt, _ = vcalendar_to_md(cal)
+        assert set(fm_rt["reminders"]) == set(fm_orig["reminders"])
+
+    def test_reminder_at_start(self):
+        """'at start' produces TRIGGER:PT0S."""
+        fm = {"uid": "at1", "title": "X", "start": "2026-01-01",
+              "reminders": ["at start"]}
+        cal = md_to_vcalendar(fm)
+        fm_rt, _ = vcalendar_to_md(cal)
+        assert "at start" in fm_rt["reminders"]
+
+    def test_valarm_not_in_ical_extra_when_parsed(self):
+        """When VALARM can be parsed, it goes to reminders not ical_extra."""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rem7\r\n"
+            "SUMMARY:Test\r\nDTSTART:20260320T100000\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT30M\r\n"
+            "DESCRIPTION:R\r\nEND:VALARM\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, _ = vcalendar_to_md(cal)
+        extra = fm.get("ical_extra", {})
+        assert "VALARM" not in extra
+        assert "30m before start" in fm["reminders"]
+
+
 # ── Storage tests ───────────────────────────────────────────────────────────
 
 class TestStorageDiscover:
