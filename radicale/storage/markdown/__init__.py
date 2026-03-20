@@ -250,13 +250,16 @@ class Collection(storage.BaseCollection):
             filename = slugify(fm.get("title", "event")) + ".md"
             target_dir = os.path.join(self._filesystem_path, "recurring")
 
-        os.makedirs(target_dir, exist_ok=True)
         target_path = os.path.join(target_dir, filename)
 
         # If the old file was at a different path (e.g., date changed), remove it
         if old_md_path and old_md_path != target_path and os.path.isfile(old_md_path):
             os.remove(old_md_path)
             self._cleanup_empty_dirs(os.path.dirname(old_md_path))
+
+        # Ensure target directory exists (after cleanup, in case old and new
+        # share the same parent directory that was removed)
+        os.makedirs(target_dir, exist_ok=True)
 
         # Write the markdown file
         md_text = render_md_file(fm, body)

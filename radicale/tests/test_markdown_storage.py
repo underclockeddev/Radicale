@@ -380,6 +380,174 @@ class TestCollectionWrite:
             populated_dir, "collection-root", "user", "work", "2026", "03")
         assert not os.path.isdir(march_dir)
 
+    def test_update_recurring_event_title(self, storage, populated_dir):
+        """Updating a recurring event's title should rename the file, not delete it."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        # Create a recurring event
+        cal = vobject.iCalendar()
+        ev = cal.add("vevent")
+        ev.add("uid").value = "standup-001"
+        ev.add("summary").value = "Daily Standup"
+        ev.add("dtstart").value = datetime.datetime(2026, 3, 30, 9, 0, 0)
+        ev.add("dtend").value = datetime.datetime(2026, 3, 30, 9, 30, 0)
+        ev.add("rrule").value = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+
+        item = Item(collection=col, vobject_item=cal, href="standup-001.ics")
+        col.upload("standup-001.ics", item)
+
+        recurring_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "recurring")
+        assert os.path.isfile(os.path.join(recurring_dir, "daily-standup.md"))
+
+        # Clear index to simulate server restart
+        storage._uid_index = {}
+
+        # Update the title
+        cal2 = vobject.iCalendar()
+        ev2 = cal2.add("vevent")
+        ev2.add("uid").value = "standup-001"
+        ev2.add("summary").value = "Morning Standup"
+        ev2.add("dtstart").value = datetime.datetime(2026, 3, 30, 9, 0, 0)
+        ev2.add("dtend").value = datetime.datetime(2026, 3, 30, 9, 30, 0)
+        ev2.add("rrule").value = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        item2 = Item(collection=col, vobject_item=cal2, href="standup-001.ics")
+        uploaded, old = col.upload("standup-001.ics", item2)
+
+        assert uploaded.uid == "standup-001"
+        assert old is not None
+        # Old file should be gone, new file should exist
+        assert not os.path.isfile(os.path.join(recurring_dir, "daily-standup.md"))
+        assert os.path.isfile(os.path.join(recurring_dir, "morning-standup.md"))
+
+    def test_recurring_to_onetime(self, storage, populated_dir):
+        """Converting a recurring event to one-time should move it from recurring/ to YYYY/MM/."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        # Create recurring event
+        cal = vobject.iCalendar()
+        ev = cal.add("vevent")
+        ev.add("uid").value = "convert-001"
+        ev.add("summary").value = "Weekly Review"
+        ev.add("dtstart").value = datetime.datetime(2026, 4, 10, 14, 0, 0)
+        ev.add("dtend").value = datetime.datetime(2026, 4, 10, 15, 0, 0)
+        ev.add("rrule").value = "FREQ=WEEKLY"
+
+        item = Item(collection=col, vobject_item=cal, href="convert-001.ics")
+        col.upload("convert-001.ics", item)
+
+        recurring_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "recurring")
+        assert os.path.isdir(recurring_dir)
+
+        storage._uid_index = {}
+
+        # Update: remove rrule
+        cal2 = vobject.iCalendar()
+        ev2 = cal2.add("vevent")
+        ev2.add("uid").value = "convert-001"
+        ev2.add("summary").value = "Weekly Review"
+        ev2.add("dtstart").value = datetime.datetime(2026, 4, 10, 14, 0, 0)
+        ev2.add("dtend").value = datetime.datetime(2026, 4, 10, 15, 0, 0)
+
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        item2 = Item(collection=col, vobject_item=cal2, href="convert-001.ics")
+        uploaded, old = col.upload("convert-001.ics", item2)
+
+        assert uploaded.uid == "convert-001"
+        # Should be in dated folder now
+        dated_path = os.path.join(
+            populated_dir, "collection-root", "user", "work",
+            "2026", "04", "10_weekly-review.md")
+        assert os.path.isfile(dated_path)
+        # recurring dir should be cleaned up
+        assert not os.path.isfile(os.path.join(recurring_dir, "weekly-review.md"))
+
+    def test_onetime_to_recurring(self, storage, populated_dir):
+        """Adding rrule to a one-time event should move it to recurring/."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        # Create one-time event
+        cal = vobject.iCalendar()
+        ev = cal.add("vevent")
+        ev.add("uid").value = "evolve-001"
+        ev.add("summary").value = "Team Meeting"
+        ev.add("dtstart").value = datetime.datetime(2026, 5, 1, 10, 0, 0)
+        ev.add("dtend").value = datetime.datetime(2026, 5, 1, 11, 0, 0)
+
+        item = Item(collection=col, vobject_item=cal, href="evolve-001.ics")
+        col.upload("evolve-001.ics", item)
+
+        dated_path = os.path.join(
+            populated_dir, "collection-root", "user", "work",
+            "2026", "05", "01_team-meeting.md")
+        assert os.path.isfile(dated_path)
+
+        storage._uid_index = {}
+
+        # Update: add rrule
+        cal2 = vobject.iCalendar()
+        ev2 = cal2.add("vevent")
+        ev2.add("uid").value = "evolve-001"
+        ev2.add("summary").value = "Team Meeting"
+        ev2.add("dtstart").value = datetime.datetime(2026, 5, 1, 10, 0, 0)
+        ev2.add("dtend").value = datetime.datetime(2026, 5, 1, 11, 0, 0)
+        ev2.add("rrule").value = "FREQ=WEEKLY"
+
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        item2 = Item(collection=col, vobject_item=cal2, href="evolve-001.ics")
+        uploaded, old = col.upload("evolve-001.ics", item2)
+
+        recurring_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "recurring")
+        assert os.path.isfile(os.path.join(recurring_dir, "team-meeting.md"))
+        assert not os.path.isfile(dated_path)
+
+    def test_timezone_roundtrip(self, storage, populated_dir):
+        """Events with timezones should round-trip correctly."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        ical_text = """\
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:STANDARD
+DTSTART:19701101T020000
+RRULE:FREQ=YEARLY;BYDAY=1SU;BYMONTH=11
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:19700308T020000
+RRULE:FREQ=YEARLY;BYDAY=2SU;BYMONTH=3
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:tz-test-001
+DTSTART;TZID=America/New_York:20260420T140000
+DTEND;TZID=America/New_York:20260420T150000
+SUMMARY:Timezone Event
+END:VEVENT
+END:VCALENDAR"""
+
+        item = Item(collection=col, text=ical_text)
+        uploaded, _ = col.upload("tz-test-001.ics", item)
+        assert uploaded.uid == "tz-test-001"
+
+        # Read back and verify timezone is preserved
+        storage._uid_index = {}
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        results = dict(col.get_multi(["tz-test-001.ics"]))
+        readback = results["tz-test-001.ics"]
+        assert readback is not None
+        assert "TZID=America/New_York" in readback.serialize() or "America/New_York" in readback.serialize()
+
     def test_set_meta(self, storage):
         col = list(storage.discover("/user/work/", depth="0"))[0]
         col.set_meta({"tag": "VCALENDAR", "D:displayname": "Personal"})

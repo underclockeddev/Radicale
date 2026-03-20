@@ -166,6 +166,13 @@ def md_to_vcalendar(fm: Dict[str, Any], body: str = "") -> vobject.base.Componen
     vevent.add("uid").value = str(uid)
 
     tz_name = fm.get("timezone")
+    # Sanitize timezone in case it was stored as a repr string
+    if tz_name and not isinstance(tz_name, str):
+        tz_name = str(tz_name)
+    if tz_name:
+        m = re.match(r".*<.*'(.+)'.*>", tz_name)
+        if m:
+            tz_name = m.group(1)
 
     # DTSTART / DTEND
     is_recurring_time_only = "start_time" in fm
@@ -309,12 +316,17 @@ def _apply_ical_extra(component: vobject.base.Component,
             try:
                 prop = component.add(name_upper)
                 val_str = str(val)
-                # Try to parse iCalendar datetime values
-                if name_upper == "DTSTAMP" or name_upper.startswith("DT"):
+                # Properties that vobject expects as datetime objects
+                _DATETIME_PROPS = {
+                    "DTSTAMP", "CREATED", "LAST-MODIFIED",
+                    "DTSTART", "DTEND", "DUE", "COMPLETED",
+                }
+                if name_upper in _DATETIME_PROPS:
                     try:
                         if val_str.endswith("Z") and len(val_str) == 16:
+                            from vobject.icalendar import utc as vobj_utc
                             dt = datetime.datetime.strptime(val_str, "%Y%m%dT%H%M%SZ")
-                            dt = dt.replace(tzinfo=datetime.timezone.utc)
+                            dt = dt.replace(tzinfo=vobj_utc)
                             prop.value = dt
                             continue
                     except (ValueError, AttributeError):
@@ -467,12 +479,20 @@ def _extract_tzid(dt_prop) -> Optional[str]:
     # Check tzinfo
     val = dt_prop.value
     if isinstance(val, datetime.datetime) and val.tzinfo:
-        tz_name = str(val.tzinfo)
         # pytz timezones have a .zone attribute
         if hasattr(val.tzinfo, "zone"):
             return val.tzinfo.zone
+        # zoneinfo/dateutil timezones have a .key attribute
         if hasattr(val.tzinfo, "key"):
             return val.tzinfo.key
+        # vobject tzicalvtz: extract name from .tzid or repr
+        if hasattr(val.tzinfo, "tzid"):
+            return val.tzinfo.tzid
+        tz_str = repr(val.tzinfo)
+        m = re.match(r".*'(.+)'.*", tz_str)
+        if m:
+            return m.group(1)
+        tz_name = str(val.tzinfo)
         if tz_name and tz_name != "UTC" and tz_name != "tzutc()":
             return tz_name
     return None
