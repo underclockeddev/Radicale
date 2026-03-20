@@ -359,14 +359,6 @@ class Storage(storage.BaseStorage):
         if self._flat_calendar_path:
             logger.info("Markdown storage (flat mode): %r",
                         self._flat_calendar_path)
-            # Ensure .calendar.yaml exists in flat mode
-            meta_path = os.path.join(self._flat_calendar_path,
-                                     ".calendar.yaml")
-            if not os.path.isfile(meta_path):
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    yaml.dump({"tag": "VCALENDAR",
-                               "D:displayname": "Calendar"}, f)
-                logger.info("Created default .calendar.yaml in flat dir")
         else:
             logger.info("Markdown storage location: %r",
                         self._filesystem_folder)
@@ -500,6 +492,13 @@ class Storage(storage.BaseStorage):
         """
         flat_dir = self._flat_calendar_path
         os.makedirs(flat_dir, exist_ok=True)
+        # Ensure .calendar.yaml exists (lazy creation on first access)
+        meta_path = os.path.join(flat_dir, ".calendar.yaml")
+        if not os.path.isfile(meta_path):
+            with open(meta_path, "w", encoding="utf-8") as f:
+                yaml.dump({"tag": "VCALENDAR",
+                           "D:displayname": "Calendar"}, f)
+            logger.info("Created default .calendar.yaml in flat dir")
         n = len(attributes)
 
         if n == 0:
