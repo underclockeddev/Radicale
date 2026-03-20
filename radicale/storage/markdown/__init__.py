@@ -313,8 +313,10 @@ class Collection(storage.BaseCollection):
 
     def sync(self, old_token: str = "") -> Tuple[str, Iterable[str]]:
         token = "http://radicale.org/ns/sync/%s" % self.etag.strip('"')
-        if old_token:
-            raise ValueError("Sync tokens are not supported")
+        # We don't support incremental sync — always return all hrefs.
+        # If old_token matches current, return empty (nothing changed).
+        if old_token and old_token == token:
+            return token, iter([])
 
         def hrefs_iter() -> Iterator[str]:
             for item in self.get_all():

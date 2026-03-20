@@ -548,6 +548,36 @@ END:VCALENDAR"""
         assert readback is not None
         assert "TZID=America/New_York" in readback.serialize() or "America/New_York" in readback.serialize()
 
+    def test_utc_timezone_roundtrip(self, storage, populated_dir):
+        """UTC events (Z suffix) must round-trip without gaining/losing hours."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        ical_text = """\
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:utc-test-001
+DTSTART:20260320T200000Z
+DTEND:20260320T210000Z
+SUMMARY:UTC Event
+END:VEVENT
+END:VCALENDAR"""
+
+        item = Item(collection=col, text=ical_text)
+        uploaded, _ = col.upload("utc-test-001.ics", item)
+        assert uploaded.uid == "utc-test-001"
+
+        # Read back and verify UTC Z suffix is preserved
+        storage._uid_index = {}
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        results = dict(col.get_multi(["utc-test-001.ics"]))
+        readback = results["utc-test-001.ics"]
+        assert readback is not None
+        serialized = readback.serialize()
+        assert "T200000Z" in serialized, f"Expected Z suffix, got: {serialized}"
+        assert "T210000Z" in serialized
+
     def test_set_meta(self, storage):
         col = list(storage.discover("/user/work/", depth="0"))[0]
         col.set_meta({"tag": "VCALENDAR", "D:displayname": "Personal"})
@@ -599,3 +629,29 @@ class TestStorageOperations:
         col2_items = list(col2.get_all())
         uids = {i.uid for i in col2_items}
         assert "lunch-001" in uids
+
+    def test_sync_token_full_sync(self, storage, populated_dir):
+        """sync('') returns all hrefs + a token."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        token, hrefs = col.sync("")
+        hrefs = list(hrefs)
+        assert token.startswith("http://radicale.org/ns/sync/")
+        assert len(hrefs) == 3  # lunch, dentist, weekly
+
+    def test_sync_token_no_change(self, storage, populated_dir):
+        """sync(current_token) returns empty hrefs (nothing changed)."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        token, _ = col.sync("")
+        token2, hrefs = col.sync(token)
+        hrefs = list(hrefs)
+        assert token2 == token
+        assert len(hrefs) == 0
+
+    def test_sync_token_stale(self, storage, populated_dir):
+        """sync(stale_token) returns all hrefs (full resync)."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        stale = "http://radicale.org/ns/sync/deadbeef"
+        token, hrefs = col.sync(stale)
+        hrefs = list(hrefs)
+        assert token.startswith("http://radicale.org/ns/sync/")
+        assert len(hrefs) == 3

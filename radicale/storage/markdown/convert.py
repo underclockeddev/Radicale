@@ -520,8 +520,11 @@ def _extract_tzid(dt_prop) -> Optional[str]:
         if m:
             return m.group(1)
         tz_name = str(val.tzinfo)
-        if tz_name and tz_name != "UTC" and tz_name != "tzutc()":
+        if tz_name and tz_name != "tzutc()":
             return tz_name
+        # Detect UTC: tzutc(), datetime.timezone.utc, pytz.UTC, etc.
+        if val.utcoffset() == datetime.timedelta(0):
+            return "UTC"
     return None
 
 
