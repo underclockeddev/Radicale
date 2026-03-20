@@ -159,7 +159,8 @@ def md_to_vcalendar(fm: Dict[str, Any], body: str = "") -> vobject.base.Componen
     """Convert frontmatter + body into a VCALENDAR vobject component."""
     cal = vobject.iCalendar()
 
-    vevent = cal.add("vevent")
+    comp_type = fm.get("component", "vevent")
+    vevent = cal.add(comp_type)
 
     # UID
     uid = fm.get("uid") or str(uuid.uuid4())
@@ -377,6 +378,9 @@ def vcalendar_to_md(cal: vobject.base.Component,
 
     fm: Dict[str, Any] = {}
     body = ""
+
+    # Store component type so we recreate the right one
+    fm["component"] = vevent.name.lower()  # vevent, vtodo, vjournal
 
     # UID
     if hasattr(vevent, "uid"):
