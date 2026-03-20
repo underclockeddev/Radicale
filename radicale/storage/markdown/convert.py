@@ -355,11 +355,16 @@ def _apply_ical_extra(component: vobject.base.Component,
 
 # ── iCalendar → MD ─────────────────────────────────────────────────────────
 
-def vcalendar_to_md(cal: vobject.base.Component) -> Tuple[Dict[str, Any], str]:
+def vcalendar_to_md(cal: vobject.base.Component,
+                    default_timezone: str = ""
+                    ) -> Tuple[Dict[str, Any], str]:
     """Convert a VCALENDAR vobject component to (frontmatter_dict, body).
 
     Extracts the first VEVENT (or VTODO/VJOURNAL) and maps its properties
     to frontmatter fields. Unrecognized properties go into ical_extra.
+
+    If *default_timezone* is set and the event has floating-time DTSTART
+    (no TZID, no Z suffix), the default timezone is assigned.
     """
     # Find the main component
     vevent = None
@@ -402,6 +407,10 @@ def vcalendar_to_md(cal: vobject.base.Component) -> Tuple[Dict[str, Any], str]:
 
     if tz_name:
         fm["timezone"] = tz_name
+    elif default_timezone and "start" in fm and not fm.get("all_day"):
+        # Floating time (no TZID, no Z) — assign default timezone so
+        # CalDAV clients always get an explicit TZID back.
+        fm["timezone"] = default_timezone
 
     # Preserve timestamp properties for ETag stability
     for ts_prop in ("dtstamp", "created", "last_modified"):

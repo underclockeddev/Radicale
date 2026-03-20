@@ -238,7 +238,7 @@ class Collection(storage.BaseCollection):
 
         # Convert iCalendar to markdown
         cal = item.vobject_item
-        fm, body = vcalendar_to_md(cal)
+        fm, body = vcalendar_to_md(cal, self._storage._default_timezone)
 
         # Determine filesystem path
         path_parts = event_path_components(fm)
@@ -340,6 +340,8 @@ class Storage(storage.BaseStorage):
         super().__init__(configuration)
         self._filesystem_folder = configuration.get(
             "storage", "filesystem_folder")
+        self._default_timezone = configuration.get(
+            "storage", "default_timezone") or ""
         self._lock = threading.RLock()
         self._uid_index = {}
 

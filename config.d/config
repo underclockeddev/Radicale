@@ -223,6 +223,10 @@ type = markdown
 # Folder for storing local collections, created if not present
 filesystem_folder = /var/lib/radicale/collections
 
+# Default timezone for events without TZID (floating time)
+# Prevents drag-and-drop offset bugs in calendar clients
+default_timezone = America/New_York
+
 # Folder for storing cache of local collections, created if not present
 # Note: only used in case of use_cache_subfolder_* options are active
 # Note: can be used on multi-instance setup to cache files on local node (see below)

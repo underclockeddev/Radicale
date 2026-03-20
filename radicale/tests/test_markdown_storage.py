@@ -200,6 +200,35 @@ class TestVcalendarToMd:
         assert "ical_extra" in fm
         assert "X-CUSTOM-PROP" in fm["ical_extra"]
 
+    def test_floating_time_gets_default_timezone(self):
+        """Floating-time event gets default_timezone assigned."""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ft1\r\n"
+            "SUMMARY:Float\r\nDTSTART:20260320T150000\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, body = vcalendar_to_md(cal, default_timezone="America/New_York")
+        assert fm["timezone"] == "America/New_York"
+        # The start time value should be preserved (not shifted)
+        assert fm["start"] == "2026-03-20T15:00:00"
+
+    def test_floating_time_no_default_stays_floating(self):
+        """Without default_timezone, floating time stays as-is."""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ft2\r\n"
+            "SUMMARY:Float\r\nDTSTART:20260320T150000\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, body = vcalendar_to_md(cal, default_timezone="")
+        assert "timezone" not in fm
+
+    def test_explicit_tz_not_overridden_by_default(self):
+        """Events with explicit TZID keep their timezone."""
+        cal = vobject.readOne(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ft3\r\n"
+            "SUMMARY:Explicit\r\nDTSTART;TZID=Europe/London:20260320T150000\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR")
+        fm, body = vcalendar_to_md(cal, default_timezone="America/New_York")
+        assert fm["timezone"] == "Europe/London"
+
 
 class TestFullConversionRoundTrip:
     def test_md_to_ical_to_md(self):
