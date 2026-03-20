@@ -60,8 +60,13 @@ class Collection(storage.BaseCollection):
         self._storage = storage_
         self._path = pathutils.strip_path(path)
         if filesystem_path is None:
-            folder = storage_._get_collection_root_folder()
-            filesystem_path = pathutils.path_to_filesystem(folder, self.path)
+            if storage_._flat_calendar_path:
+                # Flat mode: all collection paths resolve to the same dir
+                filesystem_path = storage_._flat_calendar_path
+            else:
+                folder = storage_._get_collection_root_folder()
+                filesystem_path = pathutils.path_to_filesystem(
+                    folder, self.path)
         self._filesystem_path = filesystem_path
         self._meta_cache = None
 
@@ -342,6 +347,8 @@ class Storage(storage.BaseStorage):
             "storage", "filesystem_folder")
         self._default_timezone = configuration.get(
             "storage", "default_timezone") or ""
+        self._flat_calendar_path = configuration.get(
+            "storage", "flat_calendar_path") or ""
         self._lock = threading.RLock()
         self._uid_index = {}
 
@@ -349,9 +356,24 @@ class Storage(storage.BaseStorage):
         if not os.path.exists(root):
             logger.info("Creating markdown storage root: %r", root)
             os.makedirs(root, exist_ok=True)
-        logger.info("Markdown storage location: %r", self._filesystem_folder)
+        if self._flat_calendar_path:
+            logger.info("Markdown storage (flat mode): %r",
+                        self._flat_calendar_path)
+            # Ensure .calendar.yaml exists in flat mode
+            meta_path = os.path.join(self._flat_calendar_path,
+                                     ".calendar.yaml")
+            if not os.path.isfile(meta_path):
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    yaml.dump({"tag": "VCALENDAR",
+                               "D:displayname": "Calendar"}, f)
+                logger.info("Created default .calendar.yaml in flat dir")
+        else:
+            logger.info("Markdown storage location: %r",
+                        self._filesystem_folder)
 
     def _get_collection_root_folder(self) -> str:
+        if self._flat_calendar_path:
+            return self._flat_calendar_path
         return os.path.join(self._filesystem_folder, "collection-root")
 
     # ── UID ↔ path index ────────────────────────────────────────────────
@@ -411,13 +433,16 @@ class Storage(storage.BaseStorage):
                           href: str) -> Optional[str]:
         """Look up the filesystem path for a CalDAV href."""
         uid = href[:-4] if href.endswith(".ics") else href
-        # collection_path may already be stripped or sanitized
         collection_path = collection_path.strip("/")
-        folder = self._get_collection_root_folder()
-        try:
-            fs_path = pathutils.path_to_filesystem(folder, collection_path)
-        except ValueError:
-            return None
+        if self._flat_calendar_path:
+            fs_path = self._flat_calendar_path
+        else:
+            folder = self._get_collection_root_folder()
+            try:
+                fs_path = pathutils.path_to_filesystem(
+                    folder, collection_path)
+            except ValueError:
+                return None
         index = self._get_index(collection_path, fs_path)
         return index.get(uid)
 
@@ -453,6 +478,101 @@ class Storage(storage.BaseStorage):
         sane_path = pathutils.strip_path(path)
         attributes = sane_path.split("/") if sane_path else []
 
+        if self._flat_calendar_path:
+            yield from self._discover_flat(
+                sane_path, attributes, depth, child_context_manager)
+        else:
+            yield from self._discover_nested(
+                sane_path, attributes, depth, child_context_manager)
+
+    def _discover_flat(
+            self, sane_path: str, attributes: List[str], depth: str,
+            child_context_manager: Callable[
+                [str, Optional[str]], ContextManager[None]]
+    ) -> Iterator[types.CollectionOrItem]:
+        """Discover in flat mode: all CalDAV paths map to one directory.
+
+        Expected CalDAV paths from clients:
+          ""               → root
+          "user"           → user principal
+          "user/cal"       → the calendar collection
+          "user/cal/x.ics" → a specific item
+        """
+        flat_dir = self._flat_calendar_path
+        os.makedirs(flat_dir, exist_ok=True)
+        n = len(attributes)
+
+        if n == 0:
+            # Root — yield it as a collection
+            yield Collection(self, "/", flat_dir)
+            if depth != "0":
+                # Yield each top-level subdirectory as a user principal
+                # In flat mode we have one virtual user — derive from path
+                # We need at least one child for the client to find
+                for entry in os.scandir(flat_dir):
+                    if entry.is_dir() and not entry.name.startswith(".") \
+                            and not entry.name.isdigit() \
+                            and entry.name != "recurring":
+                        child_path = entry.name
+                        with child_context_manager(child_path, None):
+                            yield Collection(
+                                self,
+                                pathutils.unstrip_path(child_path, True),
+                                flat_dir)
+            return
+
+        if n == 1:
+            # User principal (e.g. "grape") — maps to flat dir
+            user_path = attributes[0]
+            yield Collection(
+                self, pathutils.unstrip_path(user_path, True), flat_dir)
+            if depth != "0":
+                # Yield the calendar as a child. The name of the calendar
+                # doesn't matter physically — it all points to flat_dir.
+                # Scan for .calendar.yaml to find the collection name,
+                # or use a default name.
+                meta_path = os.path.join(flat_dir, ".calendar.yaml")
+                if os.path.isfile(meta_path):
+                    # Calendar exists
+                    cal_name = "default"
+                    child_path = user_path + "/" + cal_name
+                    with child_context_manager(child_path, None):
+                        yield Collection(
+                            self,
+                            pathutils.unstrip_path(child_path, True),
+                            flat_dir)
+            return
+
+        if n == 2:
+            # Calendar collection (e.g. "grape/default") → flat dir
+            col_path = "/".join(attributes)
+            col = Collection(
+                self, pathutils.unstrip_path(col_path, True), flat_dir)
+            yield col
+            if depth != "0" and col.tag:
+                for item in col.get_all():
+                    with child_context_manager(col_path, item.href):
+                        yield item
+            return
+
+        if n == 3:
+            # Item href (e.g. "grape/default/uid.ics")
+            href = attributes[2]
+            col_path = "/".join(attributes[:2])
+            col = Collection(
+                self, pathutils.unstrip_path(col_path, True), flat_dir)
+            md_path = col._md_path_for_href(href)
+            if md_path and os.path.isfile(md_path):
+                item = col._item_from_md(md_path)
+                if item is not None:
+                    yield item
+
+    def _discover_nested(
+            self, sane_path: str, attributes: List[str], depth: str,
+            child_context_manager: Callable[
+                [str, Optional[str]], ContextManager[None]]
+    ) -> Iterator[types.CollectionOrItem]:
+        """Discover in nested mode (collection-root/user/cal/)."""
         folder = self._get_collection_root_folder()
         os.makedirs(folder, exist_ok=True)
 
@@ -547,13 +667,18 @@ class Storage(storage.BaseStorage):
             items: Optional[Iterable[radicale_item.Item]] = None,
             props: Optional[Mapping[str, str]] = None
     ) -> Tuple[Collection, Dict[str, radicale_item.Item], List[str]]:
-        folder = self._get_collection_root_folder()
         sane_path = pathutils.strip_path(href)
-        filesystem_path = pathutils.path_to_filesystem(folder, sane_path)
+
+        if self._flat_calendar_path:
+            filesystem_path = self._flat_calendar_path
+        else:
+            folder = self._get_collection_root_folder()
+            filesystem_path = pathutils.path_to_filesystem(folder, sane_path)
 
         os.makedirs(filesystem_path, exist_ok=True)
 
-        col = Collection(self, pathutils.unstrip_path(sane_path, True))
+        col = Collection(self, pathutils.unstrip_path(sane_path, True),
+                         filesystem_path)
 
         if props:
             col.set_meta(props)

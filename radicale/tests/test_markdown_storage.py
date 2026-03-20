@@ -684,3 +684,98 @@ class TestStorageOperations:
         hrefs = list(hrefs)
         assert token.startswith("http://radicale.org/ns/sync/")
         assert len(hrefs) == 3
+
+
+# ── Flat mode tests ─────────────────────────────────────────────────────────
+
+@pytest.fixture
+def flat_dir(tmpdir):
+    """Create a flat calendar directory (no user/collection nesting)."""
+    cal = tmpdir  # the dir IS the calendar
+    os.makedirs(os.path.join(cal, "2026", "03"), exist_ok=True)
+    os.makedirs(os.path.join(cal, "recurring"), exist_ok=True)
+
+    with open(os.path.join(cal, ".calendar.yaml"), "w") as f:
+        yaml.dump({"tag": "VCALENDAR", "D:displayname": "My Calendar"}, f)
+
+    with open(os.path.join(cal, "2026", "03", "20_meeting.md"), "w") as f:
+        f.write('---\nuid: flat-001\ntitle: Meeting\n'
+                'start: "2026-03-20T10:00:00"\nend: "2026-03-20T11:00:00"\n'
+                '---\n')
+    return tmpdir
+
+
+@pytest.fixture
+def flat_storage(flat_dir):
+    cfg = load()
+    cfg.update(
+        {"storage": {"type": "markdown",
+                      "filesystem_folder": flat_dir,
+                      "flat_calendar_path": flat_dir}},
+        "test",
+    )
+    return Storage(cfg)
+
+
+class TestFlatMode:
+    def test_discover_collection(self, flat_storage, flat_dir):
+        """Discovering 'user/cal/' yields a collection with items."""
+        results = list(flat_storage.discover("/grape/default/", depth="0"))
+        assert len(results) == 1
+        col = results[0]
+        assert col.tag == "VCALENDAR"
+
+    def test_discover_items(self, flat_storage, flat_dir):
+        """Discovering at depth 1 yields items."""
+        results = list(flat_storage.discover("/grape/default/", depth="1"))
+        assert len(results) >= 2  # collection + at least 1 item
+        items = [r for r in results if getattr(r, 'href', None)]
+        assert len(items) == 1
+        assert items[0].uid == "flat-001"
+
+    def test_discover_user_principal(self, flat_storage, flat_dir):
+        """Discovering 'user/' yields a collection and its calendar child."""
+        results = list(flat_storage.discover("/grape/", depth="1"))
+        assert len(results) >= 1  # at least the principal itself
+
+    def test_upload_and_read(self, flat_storage, flat_dir):
+        """Upload an event and read it back in flat mode."""
+        col = list(flat_storage.discover("/grape/default/", depth="0"))[0]
+        cal = vobject.iCalendar()
+        ev = cal.add("vevent")
+        ev.add("uid").value = "flat-new-001"
+        ev.add("summary").value = "Flat Test"
+        ev.add("dtstart").value = datetime.datetime(2026, 4, 15, 9, 0, 0)
+        ev.add("dtend").value = datetime.datetime(2026, 4, 15, 10, 0, 0)
+
+        item = Item(collection=col, vobject_item=cal, href="flat-new-001.ics")
+        uploaded, old = col.upload("flat-new-001.ics", item)
+        assert uploaded.uid == "flat-new-001"
+        assert old is None
+
+        # File should be directly in flat_dir/2026/04/
+        expected = os.path.join(flat_dir, "2026", "04", "15_flat-test.md")
+        assert os.path.isfile(expected)
+
+        # Read back
+        flat_storage._uid_index = {}
+        col = list(flat_storage.discover("/grape/default/", depth="0"))[0]
+        results = dict(col.get_multi(["flat-new-001.ics"]))
+        assert results["flat-new-001.ics"] is not None
+
+    def test_create_collection_flat(self, flat_storage, flat_dir):
+        """create_collection in flat mode uses the flat dir."""
+        col, _, _ = flat_storage.create_collection(
+            "/grape/mycal/",
+            props={"tag": "VCALENDAR", "D:displayname": "Test"})
+        assert col.get_meta("tag") == "VCALENDAR"
+        # .calendar.yaml should be in flat_dir (overwritten)
+        meta_path = os.path.join(flat_dir, ".calendar.yaml")
+        assert os.path.isfile(meta_path)
+
+    def test_discover_specific_item(self, flat_storage, flat_dir):
+        """Discovering a specific item href works in flat mode."""
+        results = list(flat_storage.discover(
+            "/grape/default/flat-001.ics", depth="0"))
+        assert len(results) == 1
+        assert results[0].uid == "flat-001"

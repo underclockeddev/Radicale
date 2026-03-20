@@ -465,6 +465,10 @@ DEFAULT_CONFIG_SCHEMA: types.CONFIG_SCHEMA = OrderedDict([
             "value": "",
             "help": "default timezone for events without TZID (e.g. America/New_York)",
             "type": str}),
+        ("flat_calendar_path", {
+            "value": "",
+            "help": "when set, all calendar paths map to this single directory (flat mode, no user/collection nesting)",
+            "type": str}),
         ("_filesystem_fsync", {
             "value": "True",
             "help": "sync all changes to filesystem during requests",
