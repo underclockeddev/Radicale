@@ -40,7 +40,7 @@ from radicale.item import filter as radicale_filter
 from radicale.log import logger
 from radicale.utils import format_ut
 
-INTERNAL_TYPES: Sequence[str] = ("multifilesystem", "multifilesystem_nolock",)
+INTERNAL_TYPES: Sequence[str] = ("multifilesystem", "multifilesystem_nolock", "markdown",)
 
 # NOTE: change only if cache structure is modified to avoid cache invalidation on update
 CACHE_VERSION_RADICALE = "3.3.1"

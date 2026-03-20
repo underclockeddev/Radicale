@@ -36,6 +36,7 @@ dependencies = [
     "pika>=1.1.0",
     "requests",
     "packaging",
+    "pyyaml",
 ]
 
 
