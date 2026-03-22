@@ -136,6 +136,16 @@ class TestEventPathComponents:
         fm = {"title": "Standup", "rrule": "FREQ=DAILY"}
         assert event_path_components(fm) is None
 
+    def test_undated_vtodo_returns_none(self):
+        fm = {"title": "Backlog Item", "component": "vtodo"}
+        assert event_path_components(fm) is None
+
+    def test_dated_vtodo_returns_path(self):
+        fm = {"title": "Task", "component": "vtodo",
+              "start": "2026-05-10T09:00:00"}
+        result = event_path_components(fm)
+        assert result == ("2026", "05", "10_task.md")
+
 
 class TestMdToVcalendar:
     def test_basic_event(self):
@@ -488,7 +498,69 @@ class TestCollectionWrite:
         files = os.listdir(recurring_dir)
         assert any("weekly-sync" in f for f in files)
 
-    def test_delete_item(self, storage, populated_dir):
+    def test_upload_undated_vtodo_goes_to_tasks(self, storage, populated_dir):
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        cal = vobject.iCalendar()
+        todo = cal.add("vtodo")
+        todo.add("uid").value = "backlog-1"
+        todo.add("summary").value = "Fix Login Bug"
+        from vobject.icalendar import utc as vobj_utc
+        todo.add("dtstamp").value = datetime.datetime(
+            2026, 3, 22, 12, 0, 0, tzinfo=vobj_utc)
+
+        item = Item(collection=col, vobject_item=cal, href="backlog-1.ics")
+        uploaded, old = col.upload("backlog-1.ics", item)
+
+        assert uploaded.uid == "backlog-1"
+        tasks_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "tasks")
+        assert os.path.isdir(tasks_dir)
+        files = os.listdir(tasks_dir)
+        assert any("fix-login-bug" in f for f in files)
+
+    def test_upload_dated_vtodo_goes_to_date_folder(self, storage, populated_dir):
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        cal = vobject.iCalendar()
+        todo = cal.add("vtodo")
+        todo.add("uid").value = "dated-task-1"
+        todo.add("summary").value = "Review PR"
+        todo.add("dtstart").value = datetime.datetime(2026, 5, 10, 9, 0, 0)
+        from vobject.icalendar import utc as vobj_utc
+        todo.add("dtstamp").value = datetime.datetime(
+            2026, 3, 22, 12, 0, 0, tzinfo=vobj_utc)
+
+        item = Item(collection=col, vobject_item=cal, href="dated-task-1.ics")
+        uploaded, old = col.upload("dated-task-1.ics", item)
+
+        assert uploaded.uid == "dated-task-1"
+        expected = os.path.join(
+            populated_dir, "collection-root", "user", "work",
+            "2026", "05", "10_review-pr.md")
+        assert os.path.isfile(expected)
+
+    def test_upload_recurring_vtodo_goes_to_recurring(self, storage, populated_dir):
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+
+        cal = vobject.iCalendar()
+        todo = cal.add("vtodo")
+        todo.add("uid").value = "weekly-task-1"
+        todo.add("summary").value = "Take Out Trash"
+        todo.add("dtstart").value = datetime.datetime(2026, 1, 5, 8, 0, 0)
+        todo.add("rrule").value = "FREQ=WEEKLY"
+        from vobject.icalendar import utc as vobj_utc
+        todo.add("dtstamp").value = datetime.datetime(
+            2026, 3, 22, 12, 0, 0, tzinfo=vobj_utc)
+
+        item = Item(collection=col, vobject_item=cal, href="weekly-task-1.ics")
+        uploaded, old = col.upload("weekly-task-1.ics", item)
+
+        assert uploaded.uid == "weekly-task-1"
+        recurring_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "recurring")
+        files = os.listdir(recurring_dir)
+        assert any("take-out-trash" in f for f in files)
         col = list(storage.discover("/user/work/", depth="0"))[0]
 
         # Verify item exists

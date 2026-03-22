@@ -797,19 +797,20 @@ def md_filename_for_event(fm: Dict[str, Any]) -> str:
 
 
 def event_path_components(fm: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
-    """Return (year, month, filename) for a dated event, or None for recurring."""
+    """Return (year, month, filename) for a dated event, or None for recurring.
+
+    Returns ``None`` when the item should go in ``recurring/`` (has rrule)
+    or ``tasks/`` (undated VTODO — caller checks component type).
+    """
     if "rrule" in fm:
         return None  # goes in recurring/
 
     start = fm.get("start")
     if not start:
-        return None
+        return None  # undated — caller decides recurring/ vs tasks/
 
     try:
         dt, _ = _parse_dt(start)
-        if isinstance(dt, datetime.datetime):
-            return (str(dt.year), "%02d" % dt.month, md_filename_for_event(fm))
-        else:
-            return (str(dt.year), "%02d" % dt.month, md_filename_for_event(fm))
+        return (str(dt.year), "%02d" % dt.month, md_filename_for_event(fm))
     except (ValueError, AttributeError):
         return None

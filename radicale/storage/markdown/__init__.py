@@ -153,7 +153,7 @@ class Collection(storage.BaseCollection):
             # year dirs (numeric) and 'recurring'
             if dirpath == base:
                 dirnames[:] = [d for d in dirnames
-                               if d == "recurring" or d.isdigit()]
+                               if d in ("recurring", "tasks") or d.isdigit()]
             yield from (
                 os.path.join(dirpath, fname)
                 for fname in filenames
@@ -250,8 +250,16 @@ class Collection(storage.BaseCollection):
         if path_parts is not None:
             year, month, filename = path_parts
             target_dir = os.path.join(self._filesystem_path, year, month)
+        elif "rrule" in fm:
+            # Recurring → recurring/ folder
+            filename = slugify(fm.get("title", "event")) + ".md"
+            target_dir = os.path.join(self._filesystem_path, "recurring")
+        elif fm.get("component") == "vtodo" and "start" not in fm:
+            # Undated task → tasks/ folder
+            filename = slugify(fm.get("title", "task")) + ".md"
+            target_dir = os.path.join(self._filesystem_path, "tasks")
         else:
-            # Recurring event → recurring/ folder
+            # Fallback (undated event or other) → recurring/
             filename = slugify(fm.get("title", "event")) + ".md"
             target_dir = os.path.join(self._filesystem_path, "recurring")
 
