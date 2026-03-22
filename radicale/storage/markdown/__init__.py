@@ -26,6 +26,7 @@ event description.  The CalDAV protocol layer is unmodified — this backend
 converts between Markdown and iCalendar on the fly.
 """
 
+import datetime
 import json
 import os
 import posixpath
@@ -42,7 +43,7 @@ import radicale.item as radicale_item
 from radicale import config, pathutils, storage, types
 from radicale.log import logger
 from radicale.storage.markdown.convert import (
-    event_path_components, md_filename_for_event, md_to_vcalendar,
+    _parse_dt, event_path_components, md_filename_for_event, md_to_vcalendar,
     parse_md_file, render_md_file, slugify, vcalendar_to_md,
 )
 
@@ -237,13 +238,45 @@ class Collection(storage.BaseCollection):
               ) -> Tuple[radicale_item.Item, Optional[radicale_item.Item]]:
         # Get old item if it exists
         old_item: Optional[radicale_item.Item] = None
+        old_fm: Optional[Dict[str, Any]] = None
         old_md_path = self._md_path_for_href(href)
         if old_md_path and os.path.isfile(old_md_path):
             old_item = self._item_from_md(old_md_path)
+            try:
+                with open(old_md_path, "r", encoding="utf-8") as f:
+                    old_fm, _ = parse_md_file(f.read())
+            except Exception:
+                old_fm = None
 
         # Convert iCalendar to markdown
         cal = item.vobject_item
         fm, body = vcalendar_to_md(cal, self._storage._default_timezone)
+
+        # Track completions for recurring tasks: if DTSTART advanced
+        # forward, the old occurrence was completed.
+        if (old_fm and "rrule" in fm
+                and fm.get("component") == "vtodo"
+                and "start" in fm and "start" in old_fm):
+            try:
+                old_start, _ = _parse_dt(old_fm["start"])
+                new_start, _ = _parse_dt(fm["start"])
+                # Normalise to date for comparison
+                old_d = (old_start.date() if isinstance(old_start, datetime.datetime)
+                         else old_start)
+                new_d = (new_start.date() if isinstance(new_start, datetime.datetime)
+                         else new_start)
+                if new_d > old_d:
+                    completions = list(old_fm.get("completions", []))
+                    completions.append(old_d.isoformat())
+                    fm["completions"] = completions
+            except (ValueError, AttributeError):
+                pass
+
+        # Carry forward existing completions if not already set
+        if "completions" not in fm and old_fm:
+            old_completions = old_fm.get("completions")
+            if old_completions:
+                fm["completions"] = list(old_completions)
 
         # Determine filesystem path
         path_parts = event_path_components(fm)

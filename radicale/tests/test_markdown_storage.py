@@ -561,6 +561,102 @@ class TestCollectionWrite:
             populated_dir, "collection-root", "user", "work", "recurring")
         files = os.listdir(recurring_dir)
         assert any("take-out-trash" in f for f in files)
+
+    def test_recurring_vtodo_completion_tracking(self, storage, populated_dir):
+        """When a recurring task's DTSTART advances, log old date as completion."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        from vobject.icalendar import utc as vobj_utc
+
+        # Create a recurring weekly task starting March 22
+        cal = vobject.iCalendar()
+        todo = cal.add("vtodo")
+        todo.add("uid").value = "trash-track"
+        todo.add("summary").value = "Take Out Trash"
+        todo.add("dtstart").value = datetime.datetime(2026, 3, 22, 8, 0, 0)
+        todo.add("rrule").value = "FREQ=WEEKLY"
+        todo.add("dtstamp").value = datetime.datetime(
+            2026, 3, 22, 12, 0, 0, tzinfo=vobj_utc)
+
+        item = Item(collection=col, vobject_item=cal, href="trash-track.ics")
+        col.upload("trash-track.ics", item)
+
+        # "Complete" it: Thunderbird advances DTSTART to March 29
+        cal2 = vobject.iCalendar()
+        todo2 = cal2.add("vtodo")
+        todo2.add("uid").value = "trash-track"
+        todo2.add("summary").value = "Take Out Trash"
+        todo2.add("dtstart").value = datetime.datetime(2026, 3, 29, 8, 0, 0)
+        todo2.add("rrule").value = "FREQ=WEEKLY"
+        todo2.add("dtstamp").value = datetime.datetime(
+            2026, 3, 29, 8, 1, 0, tzinfo=vobj_utc)
+
+        item2 = Item(collection=col, vobject_item=cal2, href="trash-track.ics")
+        col.upload("trash-track.ics", item2)
+
+        # Read back and check completions
+        recurring_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "recurring")
+        md_file = os.path.join(recurring_dir, "take-out-trash.md")
+        with open(md_file) as f:
+            fm, _ = parse_md_file(f.read())
+        assert "completions" in fm
+        assert "2026-03-22" in fm["completions"]
+
+        # Complete again: advance to April 5
+        cal3 = vobject.iCalendar()
+        todo3 = cal3.add("vtodo")
+        todo3.add("uid").value = "trash-track"
+        todo3.add("summary").value = "Take Out Trash"
+        todo3.add("dtstart").value = datetime.datetime(2026, 4, 5, 8, 0, 0)
+        todo3.add("rrule").value = "FREQ=WEEKLY"
+        todo3.add("dtstamp").value = datetime.datetime(
+            2026, 4, 5, 8, 1, 0, tzinfo=vobj_utc)
+
+        item3 = Item(collection=col, vobject_item=cal3, href="trash-track.ics")
+        col.upload("trash-track.ics", item3)
+
+        with open(md_file) as f:
+            fm, _ = parse_md_file(f.read())
+        assert len(fm["completions"]) == 2
+        assert "2026-03-22" in fm["completions"]
+        assert "2026-03-29" in fm["completions"]
+
+    def test_completions_not_added_for_non_recurring(self, storage, populated_dir):
+        """Non-recurring tasks don't get completions even if date changes."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        from vobject.icalendar import utc as vobj_utc
+
+        cal = vobject.iCalendar()
+        todo = cal.add("vtodo")
+        todo.add("uid").value = "single-task"
+        todo.add("summary").value = "One Time Task"
+        todo.add("dtstart").value = datetime.datetime(2026, 3, 22, 8, 0, 0)
+        todo.add("dtstamp").value = datetime.datetime(
+            2026, 3, 22, 12, 0, 0, tzinfo=vobj_utc)
+
+        item = Item(collection=col, vobject_item=cal, href="single-task.ics")
+        col.upload("single-task.ics", item)
+
+        # Reschedule to later date (not a completion, just a move)
+        cal2 = vobject.iCalendar()
+        todo2 = cal2.add("vtodo")
+        todo2.add("uid").value = "single-task"
+        todo2.add("summary").value = "One Time Task"
+        todo2.add("dtstart").value = datetime.datetime(2026, 4, 1, 8, 0, 0)
+        todo2.add("dtstamp").value = datetime.datetime(
+            2026, 3, 25, 12, 0, 0, tzinfo=vobj_utc)
+
+        item2 = Item(collection=col, vobject_item=cal2, href="single-task.ics")
+        col.upload("single-task.ics", item2)
+
+        md_path = os.path.join(
+            populated_dir, "collection-root", "user", "work",
+            "2026", "04", "01_one-time-task.md")
+        with open(md_path) as f:
+            fm, _ = parse_md_file(f.read())
+        assert "completions" not in fm
+
+    def test_delete_item(self, storage, populated_dir):
         col = list(storage.discover("/user/work/", depth="0"))[0]
 
         # Verify item exists
