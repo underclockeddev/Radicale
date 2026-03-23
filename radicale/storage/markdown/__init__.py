@@ -266,17 +266,25 @@ class Collection(storage.BaseCollection):
                 new_d = (new_start.date() if isinstance(new_start, datetime.datetime)
                          else new_start)
                 if new_d > old_d:
-                    completions = list(old_fm.get("completions", []))
-                    completions.append(old_d.isoformat())
+                    # Merge with any completions already extracted from
+                    # RECURRENCE-ID overrides by vcalendar_to_md
+                    completions = list(fm.get("completions", []))
+                    if isinstance(old_start, datetime.datetime):
+                        completions.append(
+                            old_start.strftime("%Y-%m-%dT%H:%M:%S"))
+                    else:
+                        completions.append(old_d.isoformat())
                     fm["completions"] = completions
             except (ValueError, AttributeError):
                 pass
 
-        # Carry forward existing completions if not already set
-        if "completions" not in fm and old_fm:
-            old_completions = old_fm.get("completions")
-            if old_completions:
-                fm["completions"] = list(old_completions)
+        # Merge old file's completions with any already in fm
+        if old_fm and old_fm.get("completions"):
+            old_c = set(str(c) for c in old_fm["completions"])
+            new_c = set(str(c) for c in fm.get("completions", []))
+            merged = sorted(old_c | new_c)
+            if merged:
+                fm["completions"] = merged
 
         # Determine filesystem path
         path_parts = event_path_components(fm)

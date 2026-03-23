@@ -600,7 +600,7 @@ class TestCollectionWrite:
         with open(md_file) as f:
             fm, _ = parse_md_file(f.read())
         assert "completions" in fm
-        assert "2026-03-22" in fm["completions"]
+        assert "2026-03-22T08:00:00" in fm["completions"]
 
         # Complete again: advance to April 5
         cal3 = vobject.iCalendar()
@@ -618,8 +618,8 @@ class TestCollectionWrite:
         with open(md_file) as f:
             fm, _ = parse_md_file(f.read())
         assert len(fm["completions"]) == 2
-        assert "2026-03-22" in fm["completions"]
-        assert "2026-03-29" in fm["completions"]
+        assert "2026-03-22T08:00:00" in fm["completions"]
+        assert "2026-03-29T08:00:00" in fm["completions"]
 
     def test_completions_not_added_for_non_recurring(self, storage, populated_dir):
         """Non-recurring tasks don't get completions even if date changes."""
@@ -655,6 +655,228 @@ class TestCollectionWrite:
         with open(md_path) as f:
             fm, _ = parse_md_file(f.read())
         assert "completions" not in fm
+
+    def test_recurrence_id_override_extraction(self, storage, populated_dir):
+        """Thunderbird sends base + RECURRENCE-ID override on recurring task completion."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        from vobject.icalendar import utc as vobj_utc
+        import pytz
+
+        tz = pytz.timezone("America/New_York")
+
+        # Build a VCALENDAR with base VTODO + completed RECURRENCE-ID override
+        cal = vobject.iCalendar()
+
+        # Base recurring task
+        base = cal.add("vtodo")
+        base.add("uid").value = "recur-override-test"
+        base.add("summary").value = "Daily Standup"
+        base.add("rrule").value = "FREQ=DAILY"
+        ds = base.add("dtstart")
+        ds.value = tz.localize(datetime.datetime(2026, 3, 23, 9, 0, 0))
+        ds.params["TZID"] = ["America/New_York"]
+        base.add("dtstamp").value = datetime.datetime(
+            2026, 3, 23, 12, 0, 0, tzinfo=vobj_utc)
+        base.add("percent-complete").value = "0"
+        base.add("sequence").value = "1"
+
+        # Completed override for March 23
+        override = cal.add("vtodo")
+        override.add("uid").value = "recur-override-test"
+        override.add("summary").value = "Daily Standup"
+        override.add("status").value = "COMPLETED"
+        rid = override.add("recurrence-id")
+        rid.value = tz.localize(datetime.datetime(2026, 3, 23, 9, 0, 0))
+        rid.params["TZID"] = ["America/New_York"]
+        ods = override.add("dtstart")
+        ods.value = tz.localize(datetime.datetime(2026, 3, 23, 9, 0, 0))
+        ods.params["TZID"] = ["America/New_York"]
+        override.add("completed").value = datetime.datetime(
+            2026, 3, 23, 14, 30, 0, tzinfo=vobj_utc)
+        override.add("percent-complete").value = "100"
+        override.add("dtstamp").value = datetime.datetime(
+            2026, 3, 23, 14, 30, 0, tzinfo=vobj_utc)
+        override.add("sequence").value = "2"
+
+        item = Item(collection=col, vobject_item=cal, href="recur-override-test.ics")
+        col.upload("recur-override-test.ics", item)
+
+        # Read back the markdown and check completions extracted
+        recurring_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "recurring")
+        md_file = os.path.join(recurring_dir, "daily-standup.md")
+        with open(md_file) as f:
+            fm, _ = parse_md_file(f.read())
+        assert "completions" in fm
+        assert "2026-03-23T09:00:00" in fm["completions"]
+
+        # Now read via CalDAV and verify the override is reconstructed
+        results = dict(col.get_multi(["recur-override-test.ics"]))
+        assert results["recur-override-test.ics"] is not None
+        item_back = results["recur-override-test.ics"]
+        cal_back = vobject.readOne(item_back.serialize())
+        vtodos = [c for c in cal_back.components() if c.name == "VTODO"]
+        assert len(vtodos) == 2
+
+        # One should be the base (no RECURRENCE-ID), one the override
+        base_todos = [t for t in vtodos
+                      if not (hasattr(t, "recurrence_id")
+                              and t.recurrence_id.value)]
+        override_todos = [t for t in vtodos
+                          if hasattr(t, "recurrence_id")
+                          and t.recurrence_id.value]
+        assert len(base_todos) == 1
+        assert len(override_todos) == 1
+        assert override_todos[0].status.value.upper() == "COMPLETED"
+
+    def test_recurrence_id_multiple_completions(self, storage, populated_dir):
+        """Multiple RECURRENCE-ID overrides are all preserved."""
+        col = list(storage.discover("/user/work/", depth="0"))[0]
+        from vobject.icalendar import utc as vobj_utc
+        import pytz
+
+        tz = pytz.timezone("America/New_York")
+
+        # First completion: March 23
+        cal = vobject.iCalendar()
+        base = cal.add("vtodo")
+        base.add("uid").value = "multi-complete"
+        base.add("summary").value = "Weekly Review"
+        base.add("rrule").value = "FREQ=WEEKLY"
+        ds = base.add("dtstart")
+        ds.value = tz.localize(datetime.datetime(2026, 3, 23, 10, 0, 0))
+        ds.params["TZID"] = ["America/New_York"]
+        base.add("dtstamp").value = datetime.datetime(
+            2026, 3, 23, 12, 0, 0, tzinfo=vobj_utc)
+
+        ov1 = cal.add("vtodo")
+        ov1.add("uid").value = "multi-complete"
+        ov1.add("summary").value = "Weekly Review"
+        ov1.add("status").value = "COMPLETED"
+        rid1 = ov1.add("recurrence-id")
+        rid1.value = tz.localize(datetime.datetime(2026, 3, 23, 10, 0, 0))
+        rid1.params["TZID"] = ["America/New_York"]
+        ov1.add("completed").value = datetime.datetime(
+            2026, 3, 23, 15, 0, 0, tzinfo=vobj_utc)
+        ov1.add("percent-complete").value = "100"
+        ov1.add("dtstamp").value = datetime.datetime(
+            2026, 3, 23, 15, 0, 0, tzinfo=vobj_utc)
+
+        item = Item(collection=col, vobject_item=cal, href="multi-complete.ics")
+        col.upload("multi-complete.ics", item)
+
+        # Second completion: add March 30 override too
+        cal2 = vobject.iCalendar()
+        base2 = cal2.add("vtodo")
+        base2.add("uid").value = "multi-complete"
+        base2.add("summary").value = "Weekly Review"
+        base2.add("rrule").value = "FREQ=WEEKLY"
+        ds2 = base2.add("dtstart")
+        ds2.value = tz.localize(datetime.datetime(2026, 3, 23, 10, 0, 0))
+        ds2.params["TZID"] = ["America/New_York"]
+        base2.add("dtstamp").value = datetime.datetime(
+            2026, 3, 30, 12, 0, 0, tzinfo=vobj_utc)
+
+        ov2a = cal2.add("vtodo")
+        ov2a.add("uid").value = "multi-complete"
+        ov2a.add("summary").value = "Weekly Review"
+        ov2a.add("status").value = "COMPLETED"
+        rid2a = ov2a.add("recurrence-id")
+        rid2a.value = tz.localize(datetime.datetime(2026, 3, 23, 10, 0, 0))
+        rid2a.params["TZID"] = ["America/New_York"]
+        ov2a.add("completed").value = datetime.datetime(
+            2026, 3, 23, 15, 0, 0, tzinfo=vobj_utc)
+        ov2a.add("percent-complete").value = "100"
+        ov2a.add("dtstamp").value = datetime.datetime(
+            2026, 3, 30, 12, 0, 0, tzinfo=vobj_utc)
+
+        ov2b = cal2.add("vtodo")
+        ov2b.add("uid").value = "multi-complete"
+        ov2b.add("summary").value = "Weekly Review"
+        ov2b.add("status").value = "COMPLETED"
+        rid2b = ov2b.add("recurrence-id")
+        rid2b.value = tz.localize(datetime.datetime(2026, 3, 30, 10, 0, 0))
+        rid2b.params["TZID"] = ["America/New_York"]
+        ov2b.add("completed").value = datetime.datetime(
+            2026, 3, 30, 16, 0, 0, tzinfo=vobj_utc)
+        ov2b.add("percent-complete").value = "100"
+        ov2b.add("dtstamp").value = datetime.datetime(
+            2026, 3, 30, 16, 0, 0, tzinfo=vobj_utc)
+
+        item2 = Item(collection=col, vobject_item=cal2, href="multi-complete.ics")
+        col.upload("multi-complete.ics", item2)
+
+        # Read back and verify both completions
+        recurring_dir = os.path.join(
+            populated_dir, "collection-root", "user", "work", "recurring")
+        md_file = os.path.join(recurring_dir, "weekly-review.md")
+        with open(md_file) as f:
+            fm, _ = parse_md_file(f.read())
+        assert len(fm["completions"]) == 2
+        assert "2026-03-23T10:00:00" in fm["completions"]
+        assert "2026-03-30T10:00:00" in fm["completions"]
+
+        # CalDAV round-trip: should get 3 VTODOs (base + 2 overrides)
+        results = dict(col.get_multi(["multi-complete.ics"]))
+        cal_back = vobject.readOne(results["multi-complete.ics"].serialize())
+        vtodos = [c for c in cal_back.components() if c.name == "VTODO"]
+        assert len(vtodos) == 3
+        overrides = [t for t in vtodos
+                     if hasattr(t, "recurrence_id") and t.recurrence_id.value]
+        assert len(overrides) == 2
+
+    def test_recurrence_id_roundtrip_conversion(self):
+        """Pure conversion test: vcalendar_to_md extracts, md_to_vcalendar reconstructs."""
+        import pytz
+        from vobject.icalendar import utc as vobj_utc
+
+        tz = pytz.timezone("America/New_York")
+        cal = vobject.iCalendar()
+
+        base = cal.add("vtodo")
+        base.add("uid").value = "roundtrip-test"
+        base.add("summary").value = "Test Task"
+        base.add("rrule").value = "FREQ=WEEKLY"
+        ds = base.add("dtstart")
+        ds.value = tz.localize(datetime.datetime(2026, 4, 1, 9, 0, 0))
+        ds.params["TZID"] = ["America/New_York"]
+        base.add("dtstamp").value = datetime.datetime(
+            2026, 4, 1, 12, 0, 0, tzinfo=vobj_utc)
+
+        override = cal.add("vtodo")
+        override.add("uid").value = "roundtrip-test"
+        override.add("summary").value = "Test Task"
+        override.add("status").value = "COMPLETED"
+        rid = override.add("recurrence-id")
+        rid.value = tz.localize(datetime.datetime(2026, 4, 1, 9, 0, 0))
+        rid.params["TZID"] = ["America/New_York"]
+        override.add("completed").value = datetime.datetime(
+            2026, 4, 1, 18, 0, 0, tzinfo=vobj_utc)
+        override.add("percent-complete").value = "100"
+        override.add("dtstamp").value = datetime.datetime(
+            2026, 4, 1, 18, 0, 0, tzinfo=vobj_utc)
+
+        # Convert to markdown
+        fm, body = vcalendar_to_md(cal)
+        assert "completions" in fm
+        assert "2026-04-01T09:00:00" in fm["completions"]
+        assert fm["component"] == "vtodo"
+
+        # Convert back to vcalendar
+        cal_back = md_to_vcalendar(fm, body)
+        vtodos = [c for c in cal_back.components() if c.name == "VTODO"]
+        assert len(vtodos) == 2
+
+        base_back = [t for t in vtodos
+                     if not (hasattr(t, "recurrence_id")
+                             and t.recurrence_id.value)]
+        override_back = [t for t in vtodos
+                         if hasattr(t, "recurrence_id")
+                         and t.recurrence_id.value]
+        assert len(base_back) == 1
+        assert len(override_back) == 1
+        assert override_back[0].status.value.upper() == "COMPLETED"
+        assert override_back[0].uid.value == "roundtrip-test"
 
     def test_delete_item(self, storage, populated_dir):
         col = list(storage.discover("/user/work/", depth="0"))[0]

@@ -506,6 +506,53 @@ def md_to_vcalendar(fm: Dict[str, Any], body: str = "") -> vobject.base.Componen
     if isinstance(ical_extra, dict):
         _apply_ical_extra(vevent, ical_extra)
 
+    # Reconstruct RECURRENCE-ID overrides from completions list
+    completions = fm.get("completions")
+    if completions and comp_type == "vtodo":
+        tz_name = fm.get("timezone")
+        for completion in completions:
+            try:
+                rid_val, is_date = _parse_dt(completion, tz_name)
+            except (ValueError, AttributeError):
+                continue
+            override = vobject.newFromBehavior("vtodo")
+            override.add("uid").value = fm.get("uid", "")
+            override.add("summary").value = fm.get("title", "")
+
+            # RECURRENCE-ID
+            rid_prop = override.add("recurrence-id")
+            rid_prop.value = rid_val
+            if tz_name and not is_date:
+                rid_prop.params["TZID"] = [tz_name]
+
+            # DTSTART (same as RECURRENCE-ID)
+            dtstart = override.add("dtstart")
+            dtstart.value = rid_val
+            if is_date:
+                dtstart.value_param = "DATE"
+            elif tz_name:
+                dtstart.params["TZID"] = [tz_name]
+
+            # STATUS + COMPLETED
+            override.add("status").value = "COMPLETED"
+            override.add("percent-complete").value = "100"
+            if isinstance(rid_val, datetime.datetime):
+                from vobject.icalendar import utc as vobj_utc
+                completed_dt = rid_val.astimezone(vobj_utc) if rid_val.tzinfo else rid_val.replace(tzinfo=vobj_utc)
+                override.add("completed").value = completed_dt
+
+            # DTSTAMP (required)
+            ts_val = fm.get("dtstamp")
+            if ts_val:
+                try:
+                    from vobject.icalendar import utc as vobj_utc
+                    dt = datetime.datetime.strptime(str(ts_val), "%Y%m%dT%H%M%SZ")
+                    override.add("dtstamp").value = dt.replace(tzinfo=vobj_utc)
+                except (ValueError, AttributeError):
+                    pass
+
+            cal.add(override)
+
     return cal
 
 
@@ -570,20 +617,34 @@ def vcalendar_to_md(cal: vobject.base.Component,
                     ) -> Tuple[Dict[str, Any], str]:
     """Convert a VCALENDAR vobject component to (frontmatter_dict, body).
 
-    Extracts the first VEVENT (or VTODO/VJOURNAL) and maps its properties
-    to frontmatter fields. Unrecognized properties go into ical_extra.
+    Extracts the main VEVENT/VTODO/VJOURNAL (the one without RECURRENCE-ID)
+    and maps its properties to frontmatter fields. Unrecognized properties
+    go into ical_extra.
+
+    RECURRENCE-ID overrides with STATUS:COMPLETED are stored as entries
+    in a ``completions`` frontmatter list.
 
     If *default_timezone* is set and the event has floating-time DTSTART
     (no TZID, no Z suffix), the default timezone is assigned.
     """
-    # Find the main component
-    vevent = None
+    # Separate main component from RECURRENCE-ID overrides
+    main_comp = None
+    overrides: list = []
     for comp in cal.components():
-        if comp.name in ("VEVENT", "VTODO", "VJOURNAL"):
-            vevent = comp
-            break
-    if vevent is None:
+        if comp.name not in ("VEVENT", "VTODO", "VJOURNAL"):
+            continue
+        if hasattr(comp, "recurrence_id") and comp.recurrence_id.value:
+            overrides.append(comp)
+        elif main_comp is None:
+            main_comp = comp
+
+    # Fallback: if no component without RECURRENCE-ID, use first override
+    if main_comp is None and overrides:
+        main_comp = overrides.pop(0)
+    if main_comp is None:
         return {"uid": str(uuid.uuid4())}, ""
+
+    vevent = main_comp
 
     fm: Dict[str, Any] = {}
     body = ""
@@ -726,6 +787,24 @@ def vcalendar_to_md(cal: vobject.base.Component,
 
     if ical_extra:
         fm["ical_extra"] = ical_extra
+
+    # Extract completions from RECURRENCE-ID overrides
+    if overrides:
+        completions = []
+        for ov in overrides:
+            status = getattr(ov, "status", None)
+            is_completed = (status and status.value
+                            and status.value.upper() == "COMPLETED")
+            if is_completed and hasattr(ov, "recurrence_id"):
+                rid = ov.recurrence_id.value
+                if isinstance(rid, datetime.datetime):
+                    completions.append(rid.strftime("%Y-%m-%dT%H:%M:%S"))
+                elif isinstance(rid, datetime.date):
+                    completions.append(rid.isoformat())
+                else:
+                    completions.append(str(rid))
+        if completions:
+            fm["completions"] = completions
 
     return fm, body
 
