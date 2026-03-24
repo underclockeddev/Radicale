@@ -50,6 +50,7 @@ _HANDLED_ICAL_PROPS = {
     "location", "description", "status", "categories",
     "rrule", "exdate", "rdate", "transp", "url", "geo",
     "priority", "sequence", "dtstamp", "created", "last-modified",
+    "due", "percent-complete",
     # Structural / always-present
     "prodid", "version", "calscale", "method",
 }
@@ -425,6 +426,20 @@ def md_to_vcalendar(fm: Dict[str, Any], body: str = "") -> vobject.base.Componen
                 vevent.dtend.value = dt.date()
                 vevent.dtend.value_param = "DATE"
 
+    # DUE (VTODO-specific)
+    if "due" in fm:
+        due_val, due_is_date = _parse_dt(fm["due"], tz_name)
+        due_prop = vevent.add("due")
+        due_prop.value = due_val
+        if due_is_date:
+            due_prop.value_param = "DATE"
+        elif tz_name:
+            due_prop.params["TZID"] = [tz_name]
+
+    # PERCENT-COMPLETE (VTODO-specific)
+    if "percent_complete" in fm:
+        vevent.add("percent-complete").value = str(fm["percent_complete"])
+
     # Simple string properties
     for fm_key, ical_attr in _FM_TO_ICAL.items():
         if fm_key in fm and fm_key not in ("status",):
@@ -685,6 +700,27 @@ def vcalendar_to_md(cal: vobject.base.Component,
         # Floating time (no TZID, no Z) — assign default timezone so
         # CalDAV clients always get an explicit TZID back.
         fm["timezone"] = default_timezone
+
+    # DUE (VTODO-specific, similar to DTEND)
+    if hasattr(vevent, "due"):
+        due_val = vevent.due.value
+        if isinstance(due_val, datetime.datetime):
+            fm["due"] = due_val.strftime("%Y-%m-%dT%H:%M:%S")
+            if not tz_name:
+                due_tz = _extract_tzid(vevent.due)
+                if due_tz:
+                    fm["timezone"] = due_tz
+        elif isinstance(due_val, datetime.date):
+            fm["due"] = due_val.strftime("%Y-%m-%d")
+
+    # PERCENT-COMPLETE (VTODO-specific)
+    if "percent-complete" in vevent.contents:
+        try:
+            fm["percent_complete"] = int(
+                vevent.contents["percent-complete"][0].value)
+        except (ValueError, TypeError):
+            fm["percent_complete"] = str(
+                vevent.contents["percent-complete"][0].value)
 
     # Preserve timestamp properties for ETag stability
     for ts_prop in ("dtstamp", "created", "last_modified"):
