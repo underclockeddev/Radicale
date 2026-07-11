@@ -9,67 +9,81 @@
 """
 Storage backend that uses Markdown files with YAML frontmatter.
 
-Filesystem layout::
+One storage class drives both CalDAV (VCALENDAR) and CardDAV (VADDRESSBOOK)
+collections. All per-tag variation lives behind a :class:`CollectionProfile`
+strategy (see :mod:`radicale.storage.markdown.profile`). The Collection
+class is tag-agnostic.
+
+Filesystem layout — calendars::
 
     calendars/{user}/{calendar}/
-        .calendar.yaml              # collection metadata
-        recurring/                  # recurring events (rrule-based)
-            daily-standup.md
-        2026/
-            03/
-                20_team-lunch.md    # DD_slug.md
-                21_dentist.md
+        .calendar.yaml
+        recurring/daily-standup.md
+        tasks/water-plants.md
+        2026/03/20_team-lunch.md
 
-Each ``.md`` file is a calendar event. YAML frontmatter contains structured
-fields (title, start, end, rrule, etc.) and the markdown body becomes the
-event description.  The CalDAV protocol layer is unmodified — this backend
-converts between Markdown and iCalendar on the fly.
+Filesystem layout — address books::
+
+    contacts/{user}/{addressbook}/
+        .addressbook.yaml
+        contacts/jane-public.md
 """
 
-import datetime
-import json
 import os
 import posixpath
-import time
 import threading
-import uuid
+import time
 from hashlib import sha256
-from typing import (Callable, ContextManager, Dict, Iterable, Iterator, List,
-                    Mapping, Optional, Set, Tuple, Union, overload)
+from typing import (Any, Callable, ContextManager, Dict, Iterable, Iterator,
+                    List, Mapping, Optional, Set, Tuple, overload)
 
 import yaml
 
 import radicale.item as radicale_item
 from radicale import config, pathutils, storage, types
 from radicale.log import logger
-from radicale.storage.markdown.convert import (
-    _parse_dt, event_path_components, md_filename_for_event, md_to_vcalendar,
-    parse_md_file, render_md_file, slugify, vcalendar_to_md,
-)
+from radicale.storage.markdown.frontmatter import parse_md_file, render_md_file
+from radicale.storage.markdown.profile import (
+    CollectionProfile, ProfileRegistry)
+# Side-effect import: populates ProfileRegistry.
+from radicale.storage.markdown import profiles as _profiles  # noqa: F401
 
 
 class Collection(storage.BaseCollection):
-    """A calendar collection backed by a directory of Markdown files."""
+    """A markdown-backed collection (calendar OR addressbook).
+
+    Per-tag behavior is delegated to a :class:`CollectionProfile`. Tag is
+    resolved from on-disk metadata (or inferred from layout) on first
+    metadata read, then cached.
+    """
 
     _storage: "Storage"
     _path: str
     _filesystem_path: str
     _meta_cache: Optional[Mapping[str, str]]
+    _profile_cache: Optional[CollectionProfile]
 
     def __init__(self, storage_: "Storage", path: str,
                  filesystem_path: Optional[str] = None) -> None:
         self._storage = storage_
         self._path = pathutils.strip_path(path)
         if filesystem_path is None:
-            if storage_._flat_calendar_path:
-                # Flat mode: all collection paths resolve to the same dir
-                filesystem_path = storage_._flat_calendar_path
+            if storage_._flat_collections:
+                # Route via the second path segment (collection name).
+                parts = self.path.split("/") if self.path else []
+                entry = None
+                if len(parts) >= 2:
+                    entry = storage_._flat_entry_for_name(parts[1])
+                if entry is None:
+                    entry = storage_._flat_collections[0]
+                filesystem_path = entry["path"]
             else:
                 folder = storage_._get_collection_root_folder()
                 filesystem_path = pathutils.path_to_filesystem(
                     folder, self.path)
         self._filesystem_path = filesystem_path
         self._meta_cache = None
+        self._profile_cache = None
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -87,11 +101,43 @@ class Collection(storage.BaseCollection):
         return time.strftime("%a, %d %b %Y %H:%M:%S GMT",
                              time.gmtime(latest))
 
-    # ── Metadata (.calendar.yaml) ───────────────────────────────────────
+    # ── Profile resolution ──────────────────────────────────────────────
+
+    @property
+    def profile(self) -> CollectionProfile:
+        if self._profile_cache is None:
+            # Ensure meta is loaded so tag is known.
+            _ = self.get_meta(None)
+            if self._profile_cache is None:
+                # No metadata + no items → default profile.
+                self._profile_cache = ProfileRegistry.get_or_default(None)
+        return self._profile_cache
+
+    def _bind_profile(self, tag: Optional[str]) -> None:
+        self._profile_cache = ProfileRegistry.get_or_default(tag)
+
+    # ── Metadata ────────────────────────────────────────────────────────
+
+    def _existing_meta_path(self) -> Optional[str]:
+        """Probe registered profiles for a metadata file that exists."""
+        for fname in ProfileRegistry.metadata_filenames():
+            candidate = os.path.join(self._filesystem_path, fname)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
 
     @property
     def _meta_path(self) -> str:
-        return os.path.join(self._filesystem_path, ".calendar.yaml")
+        """Where to write metadata.
+
+        If a metadata file already exists, return its path. Otherwise
+        return the path corresponding to the bound (or default) profile.
+        """
+        existing = self._existing_meta_path()
+        if existing is not None:
+            return existing
+        prof = self._profile_cache or ProfileRegistry.get_or_default(None)
+        return os.path.join(self._filesystem_path, prof.metadata_filename)
 
     @overload
     def get_meta(self, key: None = None) -> Mapping[str, str]: ...
@@ -107,29 +153,45 @@ class Collection(storage.BaseCollection):
         return self._meta_cache.get(key)
 
     def _load_meta(self) -> Mapping[str, str]:
-        """Load collection properties from .calendar.yaml."""
+        """Load collection properties, binding the profile in the process."""
         props: Dict[str, str] = {}
-        if os.path.isfile(self._meta_path):
+        existing = self._existing_meta_path()
+        if existing is not None:
             try:
-                with open(self._meta_path, "r") as f:
+                with open(existing, "r") as f:
                     raw = yaml.safe_load(f)
                 if isinstance(raw, dict):
                     for k, v in raw.items():
                         props[str(k)] = str(v)
             except Exception as e:
-                logger.warning("Failed to load %r: %s", self._meta_path, e)
+                logger.warning("Failed to load %r: %s", existing, e)
 
-        # If we have .md files but no tag, infer VCALENDAR
         if "tag" not in props:
-            for _ in self._iter_md_files():
-                props["tag"] = "VCALENDAR"
-                break
+            inferred = self._infer_tag_from_layout()
+            if inferred is not None:
+                props["tag"] = inferred
 
+        self._bind_profile(props.get("tag"))
         return radicale_item.check_and_sanitize_props(props)
+
+    def _infer_tag_from_layout(self) -> Optional[str]:
+        """Guess the tag from on-disk directory shape.
+
+        For each registered profile, ask its layout whether items exist.
+        First non-empty layout wins.
+        """
+        if not os.path.isdir(self._filesystem_path):
+            return None
+        for prof in ProfileRegistry.all():
+            for _ in prof.layout.iter_item_paths(self._filesystem_path):
+                return prof.tag
+        return None
 
     def set_meta(self, props: Mapping[str, str]) -> None:
         sanitized = radicale_item.check_and_sanitize_props(dict(props))
-        os.makedirs(os.path.dirname(self._meta_path), exist_ok=True)
+        # Bind profile early so we write to the correct metadata filename.
+        self._bind_profile(sanitized.get("tag"))
+        os.makedirs(self._filesystem_path, exist_ok=True)
         with open(self._meta_path, "w") as f:
             yaml.dump(dict(sanitized), f, default_flow_style=False,
                       allow_unicode=True)
@@ -138,45 +200,29 @@ class Collection(storage.BaseCollection):
     # ── File scanning ───────────────────────────────────────────────────
 
     def _iter_md_files(self) -> Iterator[str]:
-        """Yield absolute paths to all .md files in this collection.
-
-        Scans year/month and recurring/ subdirectories, but does NOT
-        recurse into peer collections (directories that look like calendar
-        collections — those with .calendar.yaml or non-date names).
-        """
-        base = self._filesystem_path
-        if not os.path.isdir(base):
+        # If profile is already bound, use its layout. Otherwise we have
+        # to handle the bootstrapping case (collection has no metadata
+        # yet) — iterate via every registered layout.
+        if self._profile_cache is not None:
+            yield from self._profile_cache.layout.iter_item_paths(
+                self._filesystem_path)
             return
-        for dirpath, dirnames, filenames in os.walk(base):
-            # Skip hidden dirs
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            # At the collection root level, only recurse into
-            # year dirs (numeric) and 'recurring'
-            if dirpath == base:
-                dirnames[:] = [d for d in dirnames
-                               if d in ("recurring", "tasks") or d.isdigit()]
-            yield from (
-                os.path.join(dirpath, fname)
-                for fname in filenames
-                if fname.endswith(".md") and not fname.startswith(".")
-            )
+        seen: Set[str] = set()
+        for prof in ProfileRegistry.all():
+            for path in prof.layout.iter_item_paths(self._filesystem_path):
+                if path not in seen:
+                    seen.add(path)
+                    yield path
 
     def _href_for_md(self, md_path: str) -> str:
-        """Compute the CalDAV href for a markdown file.
-
-        The href is ``{uid}.ics`` so CalDAV clients see normal .ics names.
-        We read the uid from frontmatter, falling back to a hash of the path.
-        """
-        return self._storage._href_for_md_path(md_path)
+        return self._storage._href_for_md_path(md_path, self.profile)
 
     def _md_path_for_href(self, href: str) -> Optional[str]:
-        """Look up the filesystem path for a CalDAV href."""
         return self._storage._md_path_for_href(self.path, href)
 
     # ── Item conversion ─────────────────────────────────────────────────
 
     def _item_from_md(self, md_path: str) -> Optional[radicale_item.Item]:
-        """Read a .md file and return a radicale Item."""
         try:
             with open(md_path, "r", encoding="utf-8") as f:
                 text = f.read()
@@ -189,10 +235,12 @@ class Collection(storage.BaseCollection):
             logger.debug("No frontmatter in %r, skipping", md_path)
             return None
 
+        prof = self.profile
         try:
-            cal = md_to_vcalendar(fm, body)
+            vobj = prof.converter.md_text_to_vobject(fm, body)
         except Exception as e:
-            logger.warning("Cannot convert %r to iCalendar: %s", md_path, e)
+            logger.warning("Cannot convert %r to %s: %s",
+                           md_path, prof.tag, e)
             return None
 
         href = self._href_for_md(md_path)
@@ -201,17 +249,17 @@ class Collection(storage.BaseCollection):
             time.gmtime(os.path.getmtime(md_path)))
 
         try:
-            ical_text = cal.serialize()
+            wire_text = prof.converter.serialize_for_protocol(vobj)
         except Exception as e:
-            logger.warning("Cannot serialize iCalendar for %r: %s",
-                           md_path, e)
+            logger.warning("Cannot serialize %r for %s: %s",
+                           md_path, prof.tag, e)
             return None
 
         return radicale_item.Item(
             collection=self,
             href=href,
             last_modified=last_modified,
-            text=ical_text,
+            text=wire_text,
         )
 
     # ── Read operations ─────────────────────────────────────────────────
@@ -235,8 +283,10 @@ class Collection(storage.BaseCollection):
     # ── Write operations ────────────────────────────────────────────────
 
     def upload(self, href: str, item: radicale_item.Item
-              ) -> Tuple[radicale_item.Item, Optional[radicale_item.Item]]:
-        # Get old item if it exists
+               ) -> Tuple[radicale_item.Item, Optional[radicale_item.Item]]:
+        prof = self.profile
+
+        # Old item (if any)
         old_item: Optional[radicale_item.Item] = None
         old_fm: Optional[Dict[str, Any]] = None
         old_md_path = self._md_path_for_href(href)
@@ -248,84 +298,31 @@ class Collection(storage.BaseCollection):
             except Exception:
                 old_fm = None
 
-        # Convert iCalendar to markdown
-        cal = item.vobject_item
-        fm, body = vcalendar_to_md(cal, self._storage._default_timezone)
+        # Convert wire object → markdown
+        ctx = {"default_timezone": self._storage._default_timezone}
+        fm, body = prof.converter.vobject_to_md(item.vobject_item, ctx)
 
-        # Track completions for recurring tasks: if DTSTART advanced
-        # forward, the old occurrence was completed.
-        if (old_fm and "rrule" in fm
-                and fm.get("component") == "vtodo"
-                and "start" in fm and "start" in old_fm):
-            try:
-                old_start, _ = _parse_dt(old_fm["start"])
-                new_start, _ = _parse_dt(fm["start"])
-                # Normalise to date for comparison
-                old_d = (old_start.date() if isinstance(old_start, datetime.datetime)
-                         else old_start)
-                new_d = (new_start.date() if isinstance(new_start, datetime.datetime)
-                         else new_start)
-                if new_d > old_d:
-                    # Merge with any completions already extracted from
-                    # RECURRENCE-ID overrides by vcalendar_to_md
-                    completions = list(fm.get("completions", []))
-                    if isinstance(old_start, datetime.datetime):
-                        completions.append(
-                            old_start.strftime("%Y-%m-%dT%H:%M:%S"))
-                    else:
-                        completions.append(old_d.isoformat())
-                    fm["completions"] = completions
-            except (ValueError, AttributeError):
-                pass
+        # Profile-specific merge step (e.g. recurring completions for VTODO)
+        fm = prof.merge_on_upload(old_fm, fm)
 
-        # Merge old file's completions with any already in fm
-        if old_fm and old_fm.get("completions"):
-            old_c = set(str(c) for c in old_fm["completions"])
-            new_c = set(str(c) for c in fm.get("completions", []))
-            merged = sorted(old_c | new_c)
-            if merged:
-                fm["completions"] = merged
+        # Place the file via layout
+        target_path = prof.layout.target_path(self._filesystem_path, fm)
+        target_dir = os.path.dirname(target_path)
 
-        # Determine filesystem path
-        path_parts = event_path_components(fm)
-        if path_parts is not None:
-            year, month, filename = path_parts
-            target_dir = os.path.join(self._filesystem_path, year, month)
-        elif "rrule" in fm:
-            # Recurring → recurring/ folder
-            filename = slugify(fm.get("title", "event")) + ".md"
-            target_dir = os.path.join(self._filesystem_path, "recurring")
-        elif fm.get("component") == "vtodo" and "start" not in fm:
-            # Undated task → tasks/ folder
-            filename = slugify(fm.get("title", "task")) + ".md"
-            target_dir = os.path.join(self._filesystem_path, "tasks")
-        else:
-            # Fallback (undated event or other) → recurring/
-            filename = slugify(fm.get("title", "event")) + ".md"
-            target_dir = os.path.join(self._filesystem_path, "recurring")
-
-        target_path = os.path.join(target_dir, filename)
-
-        # If the old file was at a different path (e.g., date changed), remove it
-        if old_md_path and old_md_path != target_path and os.path.isfile(old_md_path):
+        if old_md_path and old_md_path != target_path \
+                and os.path.isfile(old_md_path):
             os.remove(old_md_path)
-            self._cleanup_empty_dirs(os.path.dirname(old_md_path))
+            prof.layout.cleanup_empty_dirs(
+                self._filesystem_path, os.path.dirname(old_md_path))
 
-        # Ensure target directory exists (after cleanup, in case old and new
-        # share the same parent directory that was removed)
         os.makedirs(target_dir, exist_ok=True)
-
-        # Write the markdown file
-        md_text = render_md_file(fm, body)
         with open(target_path, "w", encoding="utf-8") as f:
-            f.write(md_text)
+            f.write(render_md_file(fm, body))
 
-        # Update the index
-        uid = fm.get("uid", "")
+        uid = prof.converter.extract_uid(fm)
         if uid:
             self._storage._update_index(self.path, uid, target_path)
 
-        # Read back the uploaded item
         uploaded = self._item_from_md(target_path)
         if uploaded is None:
             raise RuntimeError("Failed to read back uploaded item")
@@ -333,7 +330,6 @@ class Collection(storage.BaseCollection):
 
     def delete(self, href: Optional[str] = None) -> None:
         if href is None:
-            # Delete the entire collection
             import shutil
             if os.path.isdir(self._filesystem_path):
                 shutil.rmtree(self._filesystem_path)
@@ -345,30 +341,21 @@ class Collection(storage.BaseCollection):
             raise storage.ComponentNotFoundError(href)
 
         os.remove(md_path)
-        self._cleanup_empty_dirs(os.path.dirname(md_path))
+        self.profile.layout.cleanup_empty_dirs(
+            self._filesystem_path, os.path.dirname(md_path))
 
-        # Remove from index
-        uid = href[:-4] if href.endswith(".ics") else href
+        uid = _href_to_uid(href)
         self._storage._remove_from_index(self.path, uid)
 
+    # Legacy hook kept for back-compat with code calling
+    # ``Collection._cleanup_empty_dirs`` directly.
     def _cleanup_empty_dirs(self, dirpath: str) -> None:
-        """Remove empty year/month directories up to the collection root."""
-        while dirpath != self._filesystem_path:
-            try:
-                if not os.listdir(dirpath):
-                    os.rmdir(dirpath)
-                else:
-                    break
-            except OSError:
-                break
-            dirpath = os.path.dirname(dirpath)
+        self.profile.layout.cleanup_empty_dirs(self._filesystem_path, dirpath)
 
     # ── Sync ────────────────────────────────────────────────────────────
 
     def sync(self, old_token: str = "") -> Tuple[str, Iterable[str]]:
         token = "http://radicale.org/ns/sync/%s" % self.etag.strip('"')
-        # We don't support incremental sync — always return all hrefs.
-        # If old_token matches current, return empty (nothing changed).
         if old_token and old_token == token:
             return token, iter([])
 
@@ -380,15 +367,26 @@ class Collection(storage.BaseCollection):
         return token, hrefs_iter()
 
 
+def _href_to_uid(href: str) -> str:
+    """Strip a known item extension off a CalDAV/CardDAV href."""
+    root, ext = os.path.splitext(href)
+    if ext.lower() in (".ics", ".vcf"):
+        return root
+    return href
+
+
 class Storage(storage.BaseStorage):
-    """Markdown-backed storage engine for Radicale."""
+    """Markdown-backed storage engine driving the profile registry."""
 
     _collection_class = Collection
     _filesystem_folder: str
     _lock: threading.RLock
 
-    # UID → filesystem path index, keyed by collection path
-    _uid_index: Dict[str, Dict[str, str]]  # {collection_path: {uid: md_path}}
+    _uid_index: Dict[str, Dict[str, str]]
+
+    # List of flat collections, ordered. Each entry:
+    #   {"name": str, "path": str, "tag": str}
+    _flat_collections: List[Dict[str, str]]
 
     def __init__(self, configuration: config.Configuration) -> None:
         super().__init__(configuration)
@@ -396,8 +394,15 @@ class Storage(storage.BaseStorage):
             "storage", "filesystem_folder")
         self._default_timezone = configuration.get(
             "storage", "default_timezone") or ""
-        self._flat_calendar_path = configuration.get(
-            "storage", "flat_calendar_path") or ""
+
+        self._flat_collections = self._load_flat_collections(configuration)
+
+        # Re-register profiles to thread the default timezone into the
+        # calendar profile's converter.
+        from radicale.storage.markdown.profiles import (
+            register_default_profiles)
+        register_default_profiles(default_timezone=self._default_timezone)
+
         self._lock = threading.RLock()
         self._uid_index = {}
 
@@ -405,23 +410,102 @@ class Storage(storage.BaseStorage):
         if not os.path.exists(root):
             logger.info("Creating markdown storage root: %r", root)
             os.makedirs(root, exist_ok=True)
-        if self._flat_calendar_path:
-            logger.info("Markdown storage (flat mode): %r",
-                        self._flat_calendar_path)
+        if self._flat_collections:
+            for entry in self._flat_collections:
+                logger.info("Markdown flat collection: name=%s tag=%s path=%r",
+                            entry["name"], entry["tag"], entry["path"])
         else:
             logger.info("Markdown storage location: %r",
                         self._filesystem_folder)
 
+    def _load_flat_collections(self, configuration: config.Configuration
+                               ) -> List[Dict[str, str]]:
+        """Build the ordered flat-collection list from configuration.
+
+        Sources, in order of precedence:
+
+        1. ``flat_collections`` (JSON list) — multi-collection flat mode.
+        2. ``flat_collection_path`` + ``flat_collection_tag`` — single entry.
+        3. ``flat_calendar_path`` — legacy single-entry calendar mount.
+        """
+        import json as _json
+
+        raw_multi = ""
+        try:
+            raw_multi = configuration.get("storage", "flat_collections") or ""
+        except Exception:
+            raw_multi = ""
+        if raw_multi:
+            try:
+                parsed = _json.loads(raw_multi)
+                out: List[Dict[str, str]] = []
+                for i, entry in enumerate(parsed):
+                    name = str(entry.get("name") or "default")
+                    path = str(entry.get("path") or "")
+                    tag = str(entry.get("tag") or "VCALENDAR").upper()
+                    if not path:
+                        logger.warning(
+                            "flat_collections[%d] missing 'path' — skipped", i)
+                        continue
+                    out.append({"name": name, "path": path, "tag": tag})
+                if out:
+                    return out
+            except Exception as e:
+                logger.warning("Bad flat_collections JSON %r: %s",
+                               raw_multi, e)
+
+        single_path = ""
+        try:
+            single_path = configuration.get(
+                "storage", "flat_collection_path") or ""
+        except Exception:
+            pass
+        if not single_path:
+            try:
+                single_path = configuration.get(
+                    "storage", "flat_calendar_path") or ""
+            except Exception:
+                pass
+        if single_path:
+            try:
+                single_tag = (configuration.get(
+                    "storage", "flat_collection_tag") or "VCALENDAR").upper()
+            except Exception:
+                single_tag = "VCALENDAR"
+            return [{"name": "default", "path": single_path,
+                     "tag": single_tag}]
+        return []
+
+    @property
+    def _flat_collection_path(self) -> str:
+        """Back-compat alias: path of the first flat collection (if any)."""
+        return self._flat_collections[0]["path"] if self._flat_collections else ""
+
+    def _flat_entry_for_name(self, name: str
+                             ) -> Optional[Dict[str, str]]:
+        for entry in self._flat_collections:
+            if entry["name"] == name:
+                return entry
+        return None
+
+    def _flat_entry_for_path(self, fs_path: str
+                             ) -> Optional[Dict[str, str]]:
+        for entry in self._flat_collections:
+            if entry["path"] == fs_path:
+                return entry
+        return None
+
     def _get_collection_root_folder(self) -> str:
-        if self._flat_calendar_path:
-            return self._flat_calendar_path
+        if self._flat_collections:
+            # Returned only as a discovery root for path-relative ops;
+            # actual per-collection roots live in _flat_collections.
+            return self._flat_collections[0]["path"]
         return os.path.join(self._filesystem_folder, "collection-root")
 
     # ── UID ↔ path index ────────────────────────────────────────────────
 
     def _build_index(self, collection_path: str,
                      filesystem_path: str) -> Dict[str, str]:
-        """Scan all .md files and build UID → path mapping."""
         index: Dict[str, str] = {}
         if not os.path.isdir(filesystem_path):
             return index
@@ -437,46 +521,47 @@ class Storage(storage.BaseStorage):
 
     def _get_index(self, collection_path: str,
                    filesystem_path: str) -> Dict[str, str]:
-        """Get or build the index for a collection."""
         if collection_path not in self._uid_index:
             self._uid_index[collection_path] = self._build_index(
                 collection_path, filesystem_path)
         return self._uid_index[collection_path]
 
     def _uid_from_md_file(self, md_path: str) -> Optional[str]:
-        """Read just the UID from a markdown file's frontmatter."""
         try:
             with open(md_path, "r", encoding="utf-8") as f:
-                # Read just enough to get frontmatter
                 content = f.read(4096)
         except (OSError, UnicodeDecodeError):
             return None
-
         fm, _ = parse_md_file(content)
         uid = fm.get("uid")
         return str(uid) if uid else None
 
-    def _href_for_md_path(self, md_path: str) -> str:
-        """Return the CalDAV href for a markdown file."""
+    def _href_for_md_path(self, md_path: str,
+                          profile: Optional[CollectionProfile] = None) -> str:
+        ext = profile.item_extension if profile else ".ics"
         try:
             with open(md_path, "r", encoding="utf-8") as f:
                 content = f.read(4096)
             fm, _ = parse_md_file(content)
             uid = fm.get("uid")
             if uid:
-                return str(uid) + ".ics"
+                return str(uid) + ext
         except Exception:
             pass
-        # Fallback: hash the path
-        return sha256(md_path.encode()).hexdigest()[:16] + ".ics"
+        return sha256(md_path.encode()).hexdigest()[:16] + ext
 
     def _md_path_for_href(self, collection_path: str,
                           href: str) -> Optional[str]:
-        """Look up the filesystem path for a CalDAV href."""
-        uid = href[:-4] if href.endswith(".ics") else href
+        uid = _href_to_uid(href)
         collection_path = collection_path.strip("/")
-        if self._flat_calendar_path:
-            fs_path = self._flat_calendar_path
+        if self._flat_collections:
+            parts = collection_path.split("/") if collection_path else []
+            entry: Optional[Dict[str, str]] = None
+            if len(parts) >= 2:
+                entry = self._flat_entry_for_name(parts[1])
+            if entry is None:
+                entry = self._flat_collections[0]
+            fs_path = entry["path"]
         else:
             folder = self._get_collection_root_folder()
             try:
@@ -519,83 +604,69 @@ class Storage(storage.BaseStorage):
         sane_path = pathutils.strip_path(path)
         attributes = sane_path.split("/") if sane_path else []
 
-        if self._flat_calendar_path:
+        if self._flat_collections:
             yield from self._discover_flat(
                 sane_path, attributes, depth, child_context_manager)
         else:
             yield from self._discover_nested(
                 sane_path, attributes, depth, child_context_manager)
 
+    def _bootstrap_flat_entry(self, entry: Dict[str, str]) -> None:
+        """Ensure a configured flat collection has a metadata file."""
+        flat_dir = entry["path"]
+        os.makedirs(flat_dir, exist_ok=True)
+        for fname in ProfileRegistry.metadata_filenames():
+            if os.path.isfile(os.path.join(flat_dir, fname)):
+                return
+        prof = ProfileRegistry.get_or_default(entry["tag"])
+        meta_path = os.path.join(flat_dir, prof.metadata_filename)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            yaml.dump({"tag": prof.tag,
+                       "D:displayname": prof.default_displayname}, f)
+        logger.info("Created default %s in flat dir %r",
+                    prof.metadata_filename, flat_dir)
+
     def _discover_flat(
             self, sane_path: str, attributes: List[str], depth: str,
             child_context_manager: Callable[
                 [str, Optional[str]], ContextManager[None]]
     ) -> Iterator[types.CollectionOrItem]:
-        """Discover in flat mode: all CalDAV paths map to one directory.
+        for entry in self._flat_collections:
+            self._bootstrap_flat_entry(entry)
 
-        Expected CalDAV paths from clients:
-          ""               → root
-          "user"           → user principal
-          "user/cal"       → the calendar collection
-          "user/cal/x.ics" → a specific item
-        """
-        flat_dir = self._flat_calendar_path
-        os.makedirs(flat_dir, exist_ok=True)
-        # Ensure .calendar.yaml exists (lazy creation on first access)
-        meta_path = os.path.join(flat_dir, ".calendar.yaml")
-        if not os.path.isfile(meta_path):
-            with open(meta_path, "w", encoding="utf-8") as f:
-                yaml.dump({"tag": "VCALENDAR",
-                           "D:displayname": "Calendar"}, f)
-            logger.info("Created default .calendar.yaml in flat dir")
         n = len(attributes)
 
         if n == 0:
-            # Root — yield it as a collection
-            yield Collection(self, "/", flat_dir)
-            if depth != "0":
-                # Yield each top-level subdirectory as a user principal
-                # In flat mode we have one virtual user — derive from path
-                # We need at least one child for the client to find
-                for entry in os.scandir(flat_dir):
-                    if entry.is_dir() and not entry.name.startswith(".") \
-                            and not entry.name.isdigit() \
-                            and entry.name != "recurring":
-                        child_path = entry.name
-                        with child_context_manager(child_path, None):
-                            yield Collection(
-                                self,
-                                pathutils.unstrip_path(child_path, True),
-                                flat_dir)
+            # Root pseudo-collection. Use the first flat dir as its physical
+            # backing — it's only used for last_modified.
+            root_backing = self._flat_collections[0]["path"]
+            yield Collection(self, "/", root_backing)
             return
 
         if n == 1:
-            # User principal (e.g. "grape") — maps to flat dir
             user_path = attributes[0]
+            # The user principal itself — back it with the first flat dir.
             yield Collection(
-                self, pathutils.unstrip_path(user_path, True), flat_dir)
+                self, pathutils.unstrip_path(user_path, True),
+                self._flat_collections[0]["path"])
             if depth != "0":
-                # Yield the calendar as a child. The name of the calendar
-                # doesn't matter physically — it all points to flat_dir.
-                # Scan for .calendar.yaml to find the collection name,
-                # or use a default name.
-                meta_path = os.path.join(flat_dir, ".calendar.yaml")
-                if os.path.isfile(meta_path):
-                    # Calendar exists
-                    cal_name = "default"
-                    child_path = user_path + "/" + cal_name
+                for entry in self._flat_collections:
+                    child_path = user_path + "/" + entry["name"]
                     with child_context_manager(child_path, None):
                         yield Collection(
                             self,
                             pathutils.unstrip_path(child_path, True),
-                            flat_dir)
+                            entry["path"])
             return
 
         if n == 2:
-            # Calendar collection (e.g. "grape/default") → flat dir
+            col_name = attributes[1]
+            entry = self._flat_entry_for_name(col_name)
+            if entry is None:
+                return
             col_path = "/".join(attributes)
             col = Collection(
-                self, pathutils.unstrip_path(col_path, True), flat_dir)
+                self, pathutils.unstrip_path(col_path, True), entry["path"])
             yield col
             if depth != "0" and col.tag:
                 for item in col.get_all():
@@ -604,11 +675,14 @@ class Storage(storage.BaseStorage):
             return
 
         if n == 3:
-            # Item href (e.g. "grape/default/uid.ics")
+            col_name = attributes[1]
+            entry = self._flat_entry_for_name(col_name)
+            if entry is None:
+                return
             href = attributes[2]
             col_path = "/".join(attributes[:2])
             col = Collection(
-                self, pathutils.unstrip_path(col_path, True), flat_dir)
+                self, pathutils.unstrip_path(col_path, True), entry["path"])
             md_path = col._md_path_for_href(href)
             if md_path and os.path.isfile(md_path):
                 item = col._item_from_md(md_path)
@@ -620,7 +694,6 @@ class Storage(storage.BaseStorage):
             child_context_manager: Callable[
                 [str, Optional[str]], ContextManager[None]]
     ) -> Iterator[types.CollectionOrItem]:
-        """Discover in nested mode (collection-root/user/cal/)."""
         folder = self._get_collection_root_folder()
         os.makedirs(folder, exist_ok=True)
 
@@ -630,10 +703,8 @@ class Storage(storage.BaseStorage):
             logger.debug("Unsafe path %r: %s", sane_path, e)
             return
 
-        # Check if path points to an item (href) or a collection
         href: Optional[str] = None
         if not os.path.isdir(filesystem_path):
-            # Maybe it's an item href like "uid.ics"
             if attributes:
                 href = attributes.pop()
             else:
@@ -645,7 +716,6 @@ class Storage(storage.BaseStorage):
         collection = Collection(self, pathutils.unstrip_path(sane_path, True))
 
         if href:
-            # Looking up a specific item
             md_path = collection._md_path_for_href(href)
             if md_path and os.path.isfile(md_path):
                 item = collection._item_from_md(md_path)
@@ -658,23 +728,22 @@ class Storage(storage.BaseStorage):
         if depth == "0":
             return
 
-        # Yield items in this collection (only if it's a tagged collection)
         if collection.tag:
             for item in collection.get_all():
                 with child_context_manager(sane_path, item.href):
                     yield item
 
-        # Yield child collections (subdirectories that are collections,
-        # not year/month/recurring dirs)
+        def _is_managed(name: str) -> bool:
+            return any(p.layout.is_managed_dir(name)
+                       for p in ProfileRegistry.all())
+
         for entry in os.scandir(filesystem_path):
             if not entry.is_dir():
                 continue
             name = entry.name
             if name.startswith("."):
                 continue
-            # Skip year directories and 'recurring' — they're part of
-            # the current collection, not child collections
-            if name == "recurring" or name.isdigit():
+            if _is_managed(name) or name.isdigit():
                 continue
             if not pathutils.is_safe_filesystem_path_component(name):
                 continue
@@ -689,23 +758,17 @@ class Storage(storage.BaseStorage):
         assert isinstance(item.collection, Collection)
         assert item.href
 
-        # Get the source md path
         src_path = item.collection._md_path_for_href(item.href)
         if not src_path or not os.path.isfile(src_path):
             raise storage.ComponentNotFoundError(item.href)
 
-        # Read the file content
-        with open(src_path, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        # Write to destination collection via upload
         to_collection.upload(to_href, item)
 
-        # Remove source
-        os.remove(src_path)
-        item.collection._cleanup_empty_dirs(os.path.dirname(src_path))
+        if os.path.isfile(src_path):
+            os.remove(src_path)
+            item.collection.profile.layout.cleanup_empty_dirs(
+                item.collection._filesystem_path, os.path.dirname(src_path))
 
-        # Update index
         uid = item.uid
         if uid:
             self._remove_from_index(item.collection.path, uid)
@@ -717,8 +780,14 @@ class Storage(storage.BaseStorage):
     ) -> Tuple[Collection, Dict[str, radicale_item.Item], List[str]]:
         sane_path = pathutils.strip_path(href)
 
-        if self._flat_calendar_path:
-            filesystem_path = self._flat_calendar_path
+        if self._flat_collections:
+            parts = sane_path.split("/") if sane_path else []
+            entry: Optional[Dict[str, str]] = None
+            if len(parts) >= 2:
+                entry = self._flat_entry_for_name(parts[1])
+            if entry is None:
+                entry = self._flat_collections[0]
+            filesystem_path = entry["path"]
         else:
             folder = self._get_collection_root_folder()
             filesystem_path = pathutils.path_to_filesystem(folder, sane_path)
@@ -735,8 +804,9 @@ class Storage(storage.BaseStorage):
         replaced_items: Dict[str, radicale_item.Item] = {}
 
         if items is not None and props and props.get("tag"):
+            ext = col.profile.item_extension
             for item in items:
-                uploaded, old = col.upload(item.uid + ".ics", item)
+                uploaded, old = col.upload(item.uid + ext, item)
                 if old:
                     replaced_items[uploaded.href or ""] = old
                 else:
@@ -751,7 +821,6 @@ class Storage(storage.BaseStorage):
         try:
             yield
         finally:
-            # Invalidate indexes on write to pick up external changes
             if mode == "w":
                 self._uid_index.clear()
             self._lock.release()

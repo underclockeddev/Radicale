@@ -467,7 +467,19 @@ DEFAULT_CONFIG_SCHEMA: types.CONFIG_SCHEMA = OrderedDict([
             "type": str}),
         ("flat_calendar_path", {
             "value": "",
-            "help": "when set, all calendar paths map to this single directory (flat mode, no user/collection nesting)",
+            "help": "(deprecated alias for flat_collection_path)",
+            "type": str}),
+        ("flat_collection_path", {
+            "value": "",
+            "help": "when set, all collection paths map to this single directory (flat mode, no user/collection nesting). Works for both VCALENDAR and VADDRESSBOOK; see flat_collection_tag.",
+            "type": str}),
+        ("flat_collection_tag", {
+            "value": "VCALENDAR",
+            "help": "tag used when bootstrapping a flat collection without explicit metadata (VCALENDAR | VADDRESSBOOK)",
+            "type": str}),
+        ("flat_collections", {
+            "value": "",
+            "help": 'JSON list of flat collections. Example: [{"name":"calendar","path":"/vault/Calendar","tag":"VCALENDAR"},{"name":"contacts","path":"/vault/Contacts","tag":"VADDRESSBOOK"}]',
             "type": str}),
         ("_filesystem_fsync", {
             "value": "True",
