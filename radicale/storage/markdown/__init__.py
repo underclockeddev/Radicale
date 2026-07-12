@@ -495,6 +495,43 @@ class Storage(storage.BaseStorage):
                 return entry
         return None
 
+    def _flat_entry_allowed_users(
+            self, entry: Dict[str, str]) -> Optional[List[str]]:
+        """Read ``allowed_users`` from a flat collection's metadata file.
+
+        Returns ``None`` when the key is absent — meaning the collection is
+        visible to every authenticated user. Returns a list of usernames
+        otherwise.
+        """
+        for fname in ProfileRegistry.metadata_filenames():
+            candidate = os.path.join(entry["path"], fname)
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                with open(candidate, "r") as f:
+                    raw = yaml.safe_load(f)
+            except Exception as e:
+                logger.warning("Failed to load %r: %s", candidate, e)
+                return None
+            if not isinstance(raw, dict):
+                return None
+            allowed = raw.get("allowed_users")
+            if allowed is None:
+                return None
+            if isinstance(allowed, str):
+                return [allowed]
+            if isinstance(allowed, list):
+                return [str(u) for u in allowed]
+            return None
+        return None
+
+    def _flat_entry_visible_to(
+            self, entry: Dict[str, str], user: str) -> bool:
+        allowed = self._flat_entry_allowed_users(entry)
+        if allowed is None:
+            return True
+        return user in allowed
+
     def _get_collection_root_folder(self) -> str:
         if self._flat_collections:
             # Returned only as a discovery root for path-relative ops;
@@ -651,6 +688,8 @@ class Storage(storage.BaseStorage):
                 self._flat_collections[0]["path"])
             if depth != "0":
                 for entry in self._flat_collections:
+                    if not self._flat_entry_visible_to(entry, user_path):
+                        continue
                     child_path = user_path + "/" + entry["name"]
                     with child_context_manager(child_path, None):
                         yield Collection(
@@ -663,6 +702,8 @@ class Storage(storage.BaseStorage):
             col_name = attributes[1]
             entry = self._flat_entry_for_name(col_name)
             if entry is None:
+                return
+            if not self._flat_entry_visible_to(entry, attributes[0]):
                 return
             col_path = "/".join(attributes)
             col = Collection(
@@ -678,6 +719,8 @@ class Storage(storage.BaseStorage):
             col_name = attributes[1]
             entry = self._flat_entry_for_name(col_name)
             if entry is None:
+                return
+            if not self._flat_entry_visible_to(entry, attributes[0]):
                 return
             href = attributes[2]
             col_path = "/".join(attributes[:2])
